@@ -1,23 +1,27 @@
 /**
  * CDP.js - Customer Data Platform JavaScript Library
- * This script handles collecting and sending events to your CDP server
+ * Manual configuration version - you control all tracking
  */
 
 (function(window, document) {
     "use strict";
     
+    // Initialize global cdp object if it doesn't exist
+    window.cdp = window.cdp || {};
+    
     // Configuration with defaults
     var config = {
-        endpoint: 'https://your-server-endpoint.com/collect',
-        projectId: null,
-        debug: false,
+        endpoint: window.cdp.endpoint || 'https://your-server-endpoint.com/collect',
+        // No project ID required
+        debug: window.cdp.debug || false,
         cookie_domain: 'auto',
         cookie_expires: 365, // days
         anonymize_ip: false,
         batch_events: false,  // Set to false to see immediate network requests
         batch_size: 10,
         batch_timeout: 1000, // ms
-        autoTrack: false,     // Disabled by default
+        // Auto-tracking completely disabled by default
+        autoTrack: false,
         trackPageViews: false,
         trackClicks: false,
         trackForms: false
@@ -25,7 +29,7 @@
     
     // Internal state
     var state = {
-        initialized: false,
+        initialized: true,
         userId: null,
         anonymousId: generateId(),
         sessionId: generateId(),
@@ -73,14 +77,25 @@
         document.cookie = name + '=' + value + expires + '; path=/';
     }
     
-    function getPageData() {
-        return {
+    function getPageData(overrides) {
+        var defaults = {
             title: document.title,
             url: window.location.href,
             path: window.location.pathname,
             referrer: document.referrer,
             search: window.location.search
         };
+        
+        // Apply any overrides if provided
+        if (overrides) {
+            for (var key in overrides) {
+                if (overrides.hasOwnProperty(key) && defaults.hasOwnProperty(key)) {
+                    defaults[key] = overrides[key];
+                }
+            }
+        }
+        
+        return defaults;
     }
     
     function getClientData() {
@@ -99,54 +114,6 @@
     }
     
     // Core functionality
-    function initialize(projectId, options) {
-        log('Initializing CDP with project ID:', projectId);
-        
-        if (state.initialized) {
-            warn('CDP already initialized.');
-            return;
-        }
-        
-        // Set project ID
-        config.projectId = projectId;
-        
-        // Apply custom options
-        if (options) {
-            for (var key in options) {
-                if (options.hasOwnProperty(key) && config.hasOwnProperty(key)) {
-                    config[key] = options[key];
-                }
-            }
-        }
-        
-        log('Configuration:', config);
-        
-        // Check for existing user ID
-        var existingUserId = getCookie('cdp_user_id');
-        if (existingUserId) {
-            state.userId = existingUserId;
-            log('Found existing user ID:', existingUserId);
-        } else {
-            setCookie('cdp_anonymous_id', state.anonymousId, config.cookie_expires);
-            log('Set anonymous ID cookie:', state.anonymousId);
-        }
-        
-        // Mark as initialized
-        state.initialized = true;
-        
-        // Automatic page view tracking
-        if (config.autoTrack && config.trackPageViews) {
-            log('Auto-tracking page view');
-            trackEvent('page_view', {
-                title: document.title,
-                url: window.location.href,
-                referrer: document.referrer
-            });
-        }
-        
-        log('CDP initialized successfully');
-    }
-    
     function applyConfig(options) {
         for (var key in options) {
             if (options.hasOwnProperty(key) && config.hasOwnProperty(key)) {
@@ -157,11 +124,6 @@
     }
     
     function identify(userId, traits) {
-        if (!state.initialized) {
-            warn('CDP not initialized yet. Call cdp("init", "YOUR_PROJECT_ID") first.');
-            return;
-        }
-        
         log('Identifying user:', userId, traits);
         
         state.userId = userId;
@@ -183,12 +145,17 @@
     }
     
     function trackEvent(event, properties) {
-        if (!state.initialized) {
-            warn('CDP not initialized yet. Call cdp("init", "YOUR_PROJECT_ID") first.');
-            return;
-        }
-        
         log('Tracking event:', event, properties);
+        
+        // Extract any page or user overrides from properties
+        var pageOverrides = properties && properties._page ? properties._page : null;
+        var userOverrides = properties && properties._user ? properties._user : null;
+        
+        // Remove special override properties from the main properties object
+        if (properties) {
+            if (properties._page) delete properties._page;
+            if (properties._user) delete properties._user;
+        }
         
         // Prepare event data
         var eventData = {
@@ -197,13 +164,13 @@
             timestamp: new Date().toISOString(),
             properties: properties || {},
             user: {
-                user_id: state.userId,
-                anonymous_id: state.anonymousId
+                user_id: userOverrides && userOverrides.user_id !== undefined ? userOverrides.user_id : state.userId,
+                anonymous_id: userOverrides && userOverrides.anonymous_id !== undefined ? userOverrides.anonymous_id : state.anonymousId
             },
             session: {
                 id: state.sessionId
             },
-            page: getPageData(),
+            page: getPageData(pageOverrides),
             client: getClientData()
         };
         
@@ -253,19 +220,20 @@
         log('Sending events to server:', events);
         
         var payload = {
-            project_id: config.projectId,
             batch: events,
             sent_at: new Date().toISOString()
         };
         
-        // Using standard fetch API for modern browsers
+        var payloadStr = JSON.stringify(payload);
+        
+        // Try using fetch first (modern browsers)
         try {
             fetch(config.endpoint, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'
                 },
-                body: JSON.stringify(payload)
+                body: payloadStr
             })
             .then(function(response) {
                 if (!response.ok) {
@@ -278,75 +246,71 @@
             })
             .catch(function(error) {
                 error('Error sending events:', error);
-                // Could implement retry logic here
+                // Try sendBeacon as a fallback for fetch failures
+                if (navigator.sendBeacon && navigator.sendBeacon(config.endpoint, payloadStr)) {
+                    log('Events sent using navigator.sendBeacon after fetch failure');
+                } else {
+                    fallbackToXHR(payloadStr);
+                }
             });
         } catch (e) {
-            // Fallback for browsers that don't support fetch
-            var xhr = new XMLHttpRequest();
-            xhr.open('POST', config.endpoint, true);
-            xhr.setRequestHeader('Content-Type', 'application/json');
-            xhr.onreadystatechange = function() {
-                if (xhr.readyState === 4) {
-                    if (xhr.status >= 200 && xhr.status < 300) {
-                        log('Events sent successfully via XHR');
-                    } else {
-                        error('XHR Error sending events:', xhr.status, xhr.statusText);
-                    }
-                }
-            };
-            xhr.onerror = function() {
-                error('XHR Network error when sending events');
-            };
-            xhr.send(JSON.stringify(payload));
-            log('Events sent via XHR (fetch not available)');
+            // Try sendBeacon if fetch is not available
+            if (navigator.sendBeacon && navigator.sendBeacon(config.endpoint, payloadStr)) {
+                log('Events sent using navigator.sendBeacon');
+            } else {
+                // Final fallback to XHR
+                fallbackToXHR(payloadStr);
+            }
         }
     }
     
-    // Set up event listeners if auto-tracking is enabled
-    function setupAutoTracking() {
-        if (!config.autoTrack) {
-            log('Auto-tracking disabled');
-            return;
-        }
-        
-        if (config.trackClicks) {
-            log('Setting up click tracking');
-            document.addEventListener('click', function(e) {
-                var target = e.target;
-                while (target && target.tagName !== 'A') {
-                    target = target.parentNode;
-                    if (!target) return;
+    function fallbackToXHR(payloadStr) {
+        // Fallback for browsers that don't support fetch or sendBeacon
+        var xhr = new XMLHttpRequest();
+        xhr.open('POST', config.endpoint, true);
+        xhr.setRequestHeader('Content-Type', 'application/json');
+        xhr.onreadystatechange = function() {
+            if (xhr.readyState === 4) {
+                if (xhr.status >= 200 && xhr.status < 300) {
+                    log('Events sent successfully via XHR');
+                } else {
+                    error('XHR Error sending events:', xhr.status, xhr.statusText);
                 }
-                
-                if (target.hostname !== window.location.hostname) {
-                    trackEvent('outbound_link_click', {
-                        url: target.href,
-                        text: target.innerText || target.textContent
-                    });
-                    log('Tracked outbound link click:', target.href);
-                }
-            });
-        }
-        
-        if (config.trackForms) {
-            log('Setting up form tracking');
-            document.addEventListener('submit', function(e) {
-                var form = e.target;
-                trackEvent('form_submit', {
-                    form_id: form.id,
-                    form_name: form.name,
-                    form_action: form.action
-                });
-                log('Tracked form submission:', form.id || form.name);
-            });
-        }
+            }
+        };
+        xhr.onerror = function() {
+            error('XHR Network error when sending events');
+        };
+        xhr.send(payloadStr);
+        log('Events sent via XHR (fetch and sendBeacon not available or failed)');
+    }
     }
     
-    // Initialize auto-tracking
-    if (document.readyState === 'complete') {
-        setupAutoTracking();
-    } else {
-        window.addEventListener('load', setupAutoTracking);
+    // Setup manual event tracking helpers - all auto-tracking disabled by default
+    function setupTracking(options) {
+        // Manual setup only - no automatic event tracking
+        if (options) {
+            applyConfig(options);
+        }
+        
+        log('CDP setup complete - ready for manual event tracking');
+        
+        // Initialize anonymous ID if needed
+        var existingAnonymousId = getCookie('cdp_anonymous_id');
+        if (existingAnonymousId) {
+            state.anonymousId = existingAnonymousId;
+            log('Found existing anonymous ID:', existingAnonymousId);
+        } else {
+            setCookie('cdp_anonymous_id', state.anonymousId, config.cookie_expires);
+            log('Set anonymous ID cookie:', state.anonymousId);
+        }
+        
+        // Check for existing user ID
+        var existingUserId = getCookie('cdp_user_id');
+        if (existingUserId) {
+            state.userId = existingUserId;
+            log('Found existing user ID:', existingUserId);
+        }
     }
     
     // Define the public API
@@ -359,9 +323,6 @@
         log('CDP command:', command, params);
         
         switch (command) {
-            case 'init':
-                initialize(params[0], params[1]);
-                break;
             case 'track':
                 trackEvent(params[0], params[1]);
                 break;
@@ -370,6 +331,9 @@
                 break;
             case 'config':
                 applyConfig(params[0]);
+                break;
+            case 'setup':
+                setupTracking(params[0]);
                 break;
             default:
                 error('Unknown command:', command);
@@ -383,7 +347,7 @@
     }
     
     // Expose the version
-    window.cdp.version = '1.0.0';
+    window.cdp.version = '1.1.0';
     
     // Debug helper - expose key objects to window for debugging
     if (config.debug) {
@@ -392,5 +356,10 @@
             state: state
         };
     }
+    
+    // Initialize the library but don't track anything automatically
+    setupTracking();
+    
+    log('CDP library loaded - ready for manual configuration and tracking');
     
 })(window, document);
