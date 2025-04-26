@@ -1,48 +1,43 @@
 (function(window, document) {
   "use strict";
 
+  window.cdp = window.cdp || {};
+
   var config = {
-    endpoint: window.cdp?.endpoint || 'https://your-cdp-endpoint.com/collect',
-    batch_events: false, // No batching by default
-    batch_size: 10,
-    batch_timeout: 1000,
+    endpoint: window.cdp.endpoint || 'https://your-server-endpoint.com/collect',
+    batch_events: false,
     cookie_expires: 365,
-    debug: false
   };
 
   var state = {
+    userId: null,
     anonymousId: generateId(),
     sessionId: generateId(),
-    eventQueue: []
   };
-
-  function log() {
-    if (config.debug) console.log('[CDP]', ...arguments);
-  }
 
   function generateId() {
     return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
-      var r = Math.random() * 16 | 0;
-      var v = c === 'x' ? r : (r & 0x3 | 0x8);
+      var r = Math.random() * 16 | 0, v = c === 'x' ? r : (r & 0x3 | 0x8);
       return v.toString(16);
     });
   }
 
   function getCookie(name) {
-    var value = '; ' + document.cookie;
-    var parts = value.split('; ' + name + '=');
-    if (parts.length === 2) return parts.pop().split(';').shift();
+    var value = "; " + document.cookie;
+    var parts = value.split("; " + name + "=");
+    if (parts.length === 2) return parts.pop().split(";").shift();
     return null;
   }
 
   function setCookie(name, value, days) {
     var date = new Date();
-    date.setTime(date.getTime() + (days * 86400000));
-    document.cookie = name + '=' + value + '; expires=' + date.toUTCString() + '; path=/';
+    date.setTime(date.getTime() + (days * 24 * 60 * 60 * 1000));
+    var expires = "; expires=" + date.toUTCString();
+    document.cookie = name + "=" + value + expires + "; path=/";
   }
 
   function getPageData(overrides) {
-    var base = {
+    var defaults = {
       title: document.title,
       url: window.location.href,
       path: window.location.pathname,
@@ -50,15 +45,19 @@
       search: window.location.search
     };
     if (overrides) {
-      for (var key in overrides) base[key] = overrides[key];
+      for (var key in overrides) {
+        if (overrides.hasOwnProperty(key) && defaults.hasOwnProperty(key)) {
+          defaults[key] = overrides[key];
+        }
+      }
     }
-    return base;
+    return defaults;
   }
 
   function getClientData() {
     return {
       userAgent: navigator.userAgent,
-      language: navigator.language,
+      language: navigator.language || navigator.userLanguage,
       viewport: {
         width: window.innerWidth,
         height: window.innerHeight
@@ -71,67 +70,58 @@
   }
 
   function send(payload) {
-    var json = JSON.stringify({
-      event_name: payload.event,
-      data: [payload],
-      sent_at: new Date().toISOString()
-    });
-
+    var payloadStr = JSON.stringify(payload);
     if (navigator.sendBeacon) {
-      var blob = new Blob([json], { type: 'application/json' });
-      if (navigator.sendBeacon(config.endpoint, blob)) {
-        log('Sent via sendBeacon');
-        return;
-      }
+      navigator.sendBeacon(config.endpoint, payloadStr);
+    } else {
+      fetch(config.endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: payloadStr,
+        keepalive: true
+      }).catch(function(e) {
+        console.error('CDP: send failed', e);
+      });
     }
-
-    fetch(config.endpoint, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: json,
-      keepalive: true
-    }).then(r => log('Sent via fetch')).catch(err => console.error('Fetch error:', err));
   }
 
-  function identify(traits) {
+  function trackEvent(eventName, properties) {
+    var now = new Date().toISOString();
     var eventData = {
-      event: 'identify',
+      event: eventName,
       event_id: generateId(),
-      timestamp: new Date().toISOString(),
-      properties: {},
+      timestamp: now,
+      properties: properties || {},
       user: {
-        anonymous_id: state.anonymousId,
-        ...traits
+        user_id: state.userId,
+        anonymous_id: state.anonymousId
       },
-      session: { id: state.sessionId },
-      page: getPageData(),
-      client: getClientData()
+      session: {
+        id: state.sessionId
+      },
+      page: getPageData(properties && properties._page),
+      client: getClientData(),
+      sent_at: now
     };
 
     send(eventData);
   }
 
-  function track(event, properties) {
-    var pageOverrides = properties && properties._page ? properties._page : null;
-    var userOverrides = properties && properties._user ? properties._user : null;
-
-    if (properties) {
-      delete properties._page;
-      delete properties._user;
-    }
-
+  function identifyUser(traits) {
+    var now = new Date().toISOString();
     var eventData = {
-      event: event,
+      event: 'identify',
       event_id: generateId(),
-      timestamp: new Date().toISOString(),
-      properties: properties || {},
+      timestamp: now,
+      properties: traits || {},
       user: {
-        anonymous_id: state.anonymousId,
-        ...(userOverrides || {})
+        user_id: state.userId,
+        anonymous_id: state.anonymousId
       },
-      session: { id: state.sessionId },
-      page: getPageData(pageOverrides),
-      client: getClientData()
+      session: {
+        id: state.sessionId
+      },
+      sent_at: now
     };
 
     send(eventData);
@@ -140,51 +130,55 @@
   function init(options) {
     if (options) {
       for (var key in options) {
-        if (options.hasOwnProperty(key)) {
+        if (options.hasOwnProperty(key) && config.hasOwnProperty(key)) {
           config[key] = options[key];
         }
       }
     }
 
-    var existingAnon = getCookie('cdp_anonymous_id');
-    if (existingAnon) {
-      state.anonymousId = existingAnon;
+    var existingAnonymousId = getCookie('cdp_anonymous_id');
+    if (existingAnonymousId) {
+      state.anonymousId = existingAnonymousId;
     } else {
       setCookie('cdp_anonymous_id', state.anonymousId, config.cookie_expires);
     }
 
-    log('CDP initialized', config);
+    var existingUserId = getCookie('cdp_user_id');
+    if (existingUserId) {
+      state.userId = existingUserId;
+    }
   }
 
-  // Initialize API
   var cdpQueue = window.cdp.q || [];
   window.cdp = function() {
     var args = Array.prototype.slice.call(arguments);
-    var cmd = args[0];
+    var command = args[0];
     var params = args.slice(1);
 
-    switch (cmd) {
+    switch (command) {
       case 'track':
-        track(params[0], params[1]);
+        trackEvent(params[0], params[1]);
         break;
       case 'identify':
-        identify(params[0]);
+        identifyUser(params[0]);
+        break;
+      case 'config':
+        for (var key in params[0]) {
+          if (params[0].hasOwnProperty(key) && config.hasOwnProperty(key)) {
+            config[key] = params[0][key];
+          }
+        }
         break;
       case 'init':
         init(params[0]);
         break;
-      case 'config':
-        init(params[0]);
-        break;
       default:
-        console.error('Unknown CDP command:', cmd);
+        console.error('Unknown command:', command);
     }
   };
 
   for (var i = 0; i < cdpQueue.length; i++) {
     window.cdp.apply(window, cdpQueue[i]);
   }
-
-  window.cdp.version = '2.0.0';
 
 })(window, document);
