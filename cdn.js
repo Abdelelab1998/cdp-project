@@ -184,13 +184,6 @@
       event_id: generateId(),
       timestamp: now,
       properties: traits,
-      utm: getUtmData(),
-      user: {
-        user_id: state.userId,
-        anonymous_id: state.anonymousId
-      },
-      session: {
-        id: state.sessionId
       },
       client: getClientData(),
       sent_at: now
