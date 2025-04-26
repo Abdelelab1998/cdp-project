@@ -7,8 +7,8 @@
     endpoint: window.cdp.endpoint || 'https://your-server-endpoint.com/collect',
     batch_events: false,
     cookie_expires: 365,
-    sensitive_data: false,
-    anonymize_ip: false
+    sensitive_data: false, // New config to auto-hash email/phone
+    anonymize_ip: false,   // New config to anonymize IP
   };
 
   var state = {
@@ -72,45 +72,40 @@
     };
   }
 
-  function hash(value) {
-    if (!value) return value;
-    const encoder = new TextEncoder();
-    const data = encoder.encode(value.toLowerCase().trim());
-    return crypto.subtle.digest('SHA-256', data).then((hashBuffer) => {
-      const hashArray = Array.from(new Uint8Array(hashBuffer));
-      return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+  function extractUTMs() {
+    var params = new URLSearchParams(window.location.search);
+    ['utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content'].forEach(function(k) {
+      if (params.get(k)) {
+        state.utms[k] = params.get(k).toLowerCase().trim();
+      }
     });
   }
 
   function sanitizeSensitive(data) {
-    if (!config.sensitive_data) return Promise.resolve(data);
-    var cloned = JSON.parse(JSON.stringify(data));
-
-    function traverse(obj) {
-      for (var key in obj) {
-        if (!obj.hasOwnProperty(key)) continue;
-        var val = obj[key];
-        if (val && typeof val === 'object') {
-          traverse(val);
-        } else if (typeof val === 'string') {
-          if (/@/.test(val)) { // likely email
-            obj[key] = '[hashing]';
-            hash(val).then(h => obj[key] = h);
-          } else if (/^[\d\+\-\(\) ]{7,}$/.test(val)) { // likely phone
-            obj[key] = '[hashing]';
-            hash(val).then(h => obj[key] = h);
+    var sensitiveKeys = [/email/i, /e-mail/i, /phone/i, /phonenumber/i, /mobile/i, /tel/i];
+    for (var key in data) {
+      if (data.hasOwnProperty(key)) {
+        var value = data[key];
+        sensitiveKeys.forEach(function(regex) {
+          if (regex.test(key) && typeof value === 'string') {
+            if (/email/i.test(key)) {
+              value = value.toLowerCase().trim();
+            }
+            data[key] = hash(value);
           }
-        }
+        });
       }
     }
-
-    traverse(cloned);
-    return new Promise(resolve => {
-      setTimeout(() => resolve(cloned), 10); // let async hashing apply
-    });
+    return data;
   }
 
   function send(payload) {
+    if (config.anonymize_ip) {
+      payload.anonymous_ip = true;
+    }
+    if (Object.keys(state.utms).length > 0) {
+      payload.utms = state.utms;
+    }
     var payloadStr = JSON.stringify(payload);
     if (navigator.sendBeacon) {
       navigator.sendBeacon(config.endpoint, payloadStr);
@@ -126,26 +121,6 @@
     }
   }
 
-  function captureUTMs() {
-    var params = new URLSearchParams(window.location.search);
-    ['utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content'].forEach(function(key) {
-      if (params.has(key)) {
-        state.utms[key] = params.get(key).toLowerCase();
-        sessionStorage.setItem('cdp_' + key, params.get(key).toLowerCase());
-      }
-    });
-  }
-
-  function injectUTMs(properties) {
-    var data = Object.assign({}, properties);
-    for (var key in state.utms) {
-      if (state.utms.hasOwnProperty(key) && !(key in data)) {
-        data[key] = state.utms[key];
-      }
-    }
-    return data;
-  }
-
   function trackEvent(eventName, properties) {
     var now = new Date().toISOString();
     var pageOverrides = properties && properties._page ? properties._page : null;
@@ -156,11 +131,15 @@
       delete properties._user;
     }
 
-    var baseEvent = {
+    if (config.sensitive_data) {
+      properties = sanitizeSensitive(properties);
+    }
+
+    var eventData = {
       event: eventName,
       event_id: generateId(),
       timestamp: now,
-      properties: injectUTMs(properties || {}),
+      properties: properties || {},
       user: {
         user_id: userOverrides && userOverrides.user_id ? userOverrides.user_id : state.userId,
         anonymous_id: state.anonymousId
@@ -173,18 +152,16 @@
       sent_at: now
     };
 
-    if (config.anonymize_ip) {
-      baseEvent.client.ip = 'anonymized';
-    }
-
-    sanitizeSensitive(baseEvent).then(final => {
-      send(final);
-    });
+    send(eventData);
   }
 
   function identifyUser(traits) {
     var now = new Date().toISOString();
     traits = traits || {};
+
+    if (config.sensitive_data) {
+      traits = sanitizeSensitive(traits);
+    }
 
     var eventData = {
       event: 'identify',
@@ -197,9 +174,7 @@
       sent_at: now
     };
 
-    sanitizeSensitive(eventData).then(final => {
-      send(final);
-    });
+    send(eventData);
   }
 
   function init(options) {
@@ -211,7 +186,7 @@
       }
     }
 
-    captureUTMs();
+    extractUTMs();
 
     var existingAnonymousId = getCookie('cdp_anonymous_id');
     if (existingAnonymousId) {
@@ -225,6 +200,21 @@
       state.userId = existingUserId;
     }
   }
+
+  function simpleHash(str) {
+    var hash = 0, i, chr;
+    if (str.length === 0) return hash;
+    for (i = 0; i < str.length; i++) {
+      chr = str.charCodeAt(i);
+      hash = ((hash << 5) - hash) + chr;
+      hash |= 0;
+    }
+    return 'hashed_' + Math.abs(hash);
+  }
+
+  window.hash = function(data) {
+    return simpleHash(data.toString());
+  };
 
   var cdpQueue = window.cdp.q || [];
   window.cdp = function() {
@@ -249,8 +239,6 @@
       case 'init':
         init(params[0]);
         break;
-      case 'hash':
-        return hash(params[0]);
       default:
         console.error('Unknown command:', command);
     }
