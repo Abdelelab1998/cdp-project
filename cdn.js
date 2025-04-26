@@ -7,15 +7,12 @@
     endpoint: window.cdp.endpoint || 'https://your-server-endpoint.com/collect',
     batch_events: false,
     cookie_expires: 365,
-    sensitive_data: false,
-    anonymize_ip: false
   };
 
   var state = {
     userId: null,
     anonymousId: generateId(),
     sessionId: generateId(),
-    utms: {}
   };
 
   function generateId() {
@@ -37,15 +34,6 @@
     date.setTime(date.getTime() + (days * 24 * 60 * 60 * 1000));
     var expires = "; expires=" + date.toUTCString();
     document.cookie = name + "=" + value + expires + "; path=/";
-  }
-
-  function parseUTMs() {
-    var params = new URLSearchParams(window.location.search);
-    ['utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term'].forEach(function(key) {
-      if (params.has(key)) {
-        state.utms[key] = params.get(key).toLowerCase().trim();
-      }
-    });
   }
 
   function getPageData(overrides) {
@@ -81,61 +69,8 @@
     };
   }
 
-  async function _sha256(str) {
-    const utf8 = new TextEncoder().encode(str);
-    const hashBuffer = await crypto.subtle.digest('SHA-256', utf8);
-    const hashArray = Array.from(new Uint8Array(hashBuffer));
-    return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-  }
-
-  window.hash = function(input) {
-    var cleaned = (input || '').toLowerCase().trim();
-    var done = false;
-    var result = '';
-
-    _sha256(cleaned).then(function(hashed) {
-      result = hashed;
-      done = true;
-    });
-
-    var start = Date.now();
-    while (!done) {
-      if (Date.now() - start > 500) break; // safety break after 500ms
-    }
-    return result || 'hash_pending';
-  };
-
-  function sanitizeData(obj) {
-    if (!config.sensitive_data) return obj;
-
-    var clone = JSON.parse(JSON.stringify(obj));
-    function traverse(o) {
-      for (var key in o) {
-        if (o.hasOwnProperty(key)) {
-          if (typeof o[key] === 'object' && o[key] !== null) {
-            traverse(o[key]);
-          } else if (typeof o[key] === 'string') {
-            var val = o[key].toLowerCase().trim();
-            if (val.includes('@') && val.includes('.')) {
-              o[key] = hash(val);
-            } else if (/^\+?[0-9\-\(\)\s]{7,15}$/.test(val)) {
-              o[key] = hash(val);
-            }
-          }
-        }
-      }
-    }
-    traverse(clone);
-    return clone;
-  }
-
   function send(payload) {
-    var final = sanitizeData(payload);
-    if (config.anonymize_ip) {
-      final.anonymize_ip = true;
-    }
-    var payloadStr = JSON.stringify(final);
-
+    var payloadStr = JSON.stringify(payload);
     if (navigator.sendBeacon) {
       navigator.sendBeacon(config.endpoint, payloadStr);
     } else {
@@ -165,7 +100,6 @@
       event_id: generateId(),
       timestamp: now,
       properties: properties || {},
-      utms: state.utms,
       user: {
         user_id: userOverrides && userOverrides.user_id ? userOverrides.user_id : state.userId,
         anonymous_id: state.anonymousId
@@ -181,18 +115,23 @@
     send(eventData);
   }
 
-  function identifyUser(traits) {
-    var now = new Date().toISOString();
-    var eventData = {
-      event: 'identify',
-      event_id: generateId(),
-      timestamp: now,
-      properties: sanitizeData(traits || {}),
-      sent_at: now
-    };
+function identifyUser(traits) {
+  var now = new Date().toISOString();
+  traits = traits || {};
 
-    send(eventData);
-  }
+  var eventData = {
+    event: 'identify',
+    event_id: generateId(),
+    timestamp: now,
+    properties: traits,
+    session: {
+      id: state.sessionId
+    },
+    sent_at: now
+  };
+
+  send(eventData);
+}
 
   function init(options) {
     if (options) {
@@ -202,8 +141,6 @@
         }
       }
     }
-
-    parseUTMs();
 
     var existingAnonymousId = getCookie('cdp_anonymous_id');
     if (existingAnonymousId) {
