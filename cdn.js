@@ -4,7 +4,7 @@
     window.cdp = window.cdp || {};
 
     var config = {
-        endpoint: window.cdp.endpoint || 'https://your-server-endpoint.com/collect',
+        endpoint: window.cdp.endpoint,
         debug: window.cdp.debug || false,
         cookie_domain: 'auto',
         cookie_expires: 365,
