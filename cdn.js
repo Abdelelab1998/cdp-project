@@ -132,17 +132,28 @@
   }
 
   function sendToServer(payload) {
+    var payloadStr = JSON.stringify(payload);
+
+    if (navigator.sendBeacon) {
+      try {
+        var blob = new Blob([payloadStr], { type: 'application/json' });
+        var sent = navigator.sendBeacon(config.endpoint, blob);
+        if (sent) return;
+      } catch (e) {}
+    }
+
     try {
       fetch(config.endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
+        body: payloadStr,
+        keepalive: true
       });
     } catch (e) {
       var xhr = new XMLHttpRequest();
       xhr.open('POST', config.endpoint, true);
       xhr.setRequestHeader('Content-Type', 'application/json');
-      xhr.send(JSON.stringify(payload));
+      xhr.send(payloadStr);
     }
   }
 
