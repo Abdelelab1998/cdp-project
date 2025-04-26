@@ -244,5 +244,5 @@
   for (var i = 0; i < cdpQueue.length; i++) {
     window.cdp.apply(window, cdpQueue[i]);
   }
-
+window.hash = hash;
 })(window, document);
