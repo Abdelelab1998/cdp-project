@@ -7,16 +7,26 @@
     endpoint: window.cdp.endpoint || 'https://your-server-endpoint.com/collect',
     batch_events: false,
     cookie_expires: 365,
-    sensitive_data: false, // New config to auto-hash email/phone
-    anonymize_ip: false,   // New config to anonymize IP
+    sensitive_data: false,
+    anonymize_ip: false
   };
 
   var state = {
     userId: null,
     anonymousId: generateId(),
     sessionId: generateId(),
-    utms: {}
+    utmParams: {}
   };
+
+  // UTM keys
+  var utmKeys = ['utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content'];
+
+  // Regex patterns
+  var emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/i;
+  var phoneRegex = /^[\d\s+\-().]{6,20}$/i;
+
+  // Capture UTMs from URL
+  captureUTMs();
 
   function generateId() {
     return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
@@ -37,6 +47,26 @@
     date.setTime(date.getTime() + (days * 24 * 60 * 60 * 1000));
     var expires = "; expires=" + date.toUTCString();
     document.cookie = name + "=" + value + expires + "; path=/";
+  }
+
+  function captureUTMs() {
+    var params = new URLSearchParams(window.location.search);
+    utmKeys.forEach(function(key) {
+      if (params.has(key)) {
+        var value = params.get(key);
+        if (value) {
+          state.utmParams[key] = value.toLowerCase();
+          sessionStorage.setItem('cdp_' + key, value.toLowerCase());
+        }
+      }
+    });
+    // Also restore from session if no new UTMs
+    utmKeys.forEach(function(key) {
+      if (!state.utmParams[key]) {
+        var stored = sessionStorage.getItem('cdp_' + key);
+        if (stored) state.utmParams[key] = stored;
+      }
+    });
   }
 
   function getPageData(overrides) {
@@ -72,40 +102,54 @@
     };
   }
 
-  function extractUTMs() {
-    var params = new URLSearchParams(window.location.search);
-    ['utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content'].forEach(function(k) {
-      if (params.get(k)) {
-        state.utms[k] = params.get(k).toLowerCase().trim();
-      }
-    });
+  // Manual fast SHA256 wrapper (no await needed)
+  async function cryptoHash(value) {
+    const encoder = new TextEncoder();
+    const data = encoder.encode(value.toLowerCase().trim());
+    const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+    return Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
   }
 
-  function sanitizeSensitive(data) {
-    var sensitiveKeys = [/email/i, /e-mail/i, /phone/i, /phonenumber/i, /mobile/i, /tel/i];
-    for (var key in data) {
-      if (data.hasOwnProperty(key)) {
-        var value = data[key];
-        sensitiveKeys.forEach(function(regex) {
-          if (regex.test(key) && typeof value === 'string') {
-            if (/email/i.test(key)) {
-              value = value.toLowerCase().trim();
-            }
-            data[key] = hash(value);
-          }
-        });
+  window.hash = function(value) {
+    var id = "hash_" + generateId().slice(0,6);
+    cryptoHash(value).then(function(result) {
+      sessionStorage.setItem(id, result);
+    });
+    return id;
+  };
+
+  function getHashedValue(id) {
+    return sessionStorage.getItem(id) || id;
+  }
+
+  function sanitizeProperties(properties) {
+    var cleanProps = {};
+
+    for (var key in properties) {
+      if (!properties.hasOwnProperty(key)) continue;
+
+      var value = properties[key];
+
+      if (typeof value === 'string') {
+        value = value.trim();
+        if (config.sensitive_data) {
+          if (emailRegex.test(value)) value = getHashedValue(hash(value));
+          if (phoneRegex.test(value)) value = getHashedValue(hash(value));
+        }
       }
+
+      cleanProps[key] = value;
     }
-    return data;
+
+    // Attach UTMs if available
+    if (Object.keys(state.utmParams).length > 0) {
+      cleanProps.utm = state.utmParams;
+    }
+
+    return cleanProps;
   }
 
   function send(payload) {
-    if (config.anonymize_ip) {
-      payload.anonymous_ip = true;
-    }
-    if (Object.keys(state.utms).length > 0) {
-      payload.utms = state.utms;
-    }
     var payloadStr = JSON.stringify(payload);
     if (navigator.sendBeacon) {
       navigator.sendBeacon(config.endpoint, payloadStr);
@@ -131,15 +175,11 @@
       delete properties._user;
     }
 
-    if (config.sensitive_data) {
-      properties = sanitizeSensitive(properties);
-    }
-
     var eventData = {
       event: eventName,
       event_id: generateId(),
       timestamp: now,
-      properties: properties || {},
+      properties: sanitizeProperties(properties || {}),
       user: {
         user_id: userOverrides && userOverrides.user_id ? userOverrides.user_id : state.userId,
         anonymous_id: state.anonymousId
@@ -152,6 +192,10 @@
       sent_at: now
     };
 
+    if (config.anonymize_ip) {
+      eventData.ip_override = "0.0.0.0";
+    }
+
     send(eventData);
   }
 
@@ -159,20 +203,20 @@
     var now = new Date().toISOString();
     traits = traits || {};
 
-    if (config.sensitive_data) {
-      traits = sanitizeSensitive(traits);
-    }
-
     var eventData = {
       event: 'identify',
       event_id: generateId(),
       timestamp: now,
-      properties: traits,
+      properties: sanitizeProperties(traits),
       session: {
         id: state.sessionId
       },
       sent_at: now
     };
+
+    if (config.anonymize_ip) {
+      eventData.ip_override = "0.0.0.0";
+    }
 
     send(eventData);
   }
@@ -186,35 +230,18 @@
       }
     }
 
-    extractUTMs();
-
-    var existingAnonymousId = getCookie('cdp_anonymous_id');
+    var existingAnonymousId = sessionStorage.getItem('cdp_anonymous_id');
     if (existingAnonymousId) {
       state.anonymousId = existingAnonymousId;
     } else {
-      setCookie('cdp_anonymous_id', state.anonymousId, config.cookie_expires);
+      sessionStorage.setItem('cdp_anonymous_id', state.anonymousId);
     }
 
-    var existingUserId = getCookie('cdp_user_id');
+    var existingUserId = sessionStorage.getItem('cdp_user_id');
     if (existingUserId) {
       state.userId = existingUserId;
     }
   }
-
-  function simpleHash(str) {
-    var hash = 0, i, chr;
-    if (str.length === 0) return hash;
-    for (i = 0; i < str.length; i++) {
-      chr = str.charCodeAt(i);
-      hash = ((hash << 5) - hash) + chr;
-      hash |= 0;
-    }
-    return 'hashed_' + Math.abs(hash);
-  }
-
-  window.hash = function(data) {
-    return simpleHash(data.toString());
-  };
 
   var cdpQueue = window.cdp.q || [];
   window.cdp = function() {
