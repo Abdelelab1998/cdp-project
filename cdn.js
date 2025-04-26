@@ -8,25 +8,15 @@
     batch_events: false,
     cookie_expires: 365,
     sensitive_data: false,
-    anonymize_ip: false
+    anonymize_ip: false,
   };
 
   var state = {
     userId: null,
     anonymousId: generateId(),
     sessionId: generateId(),
-    utmParams: {}
+    utms: {}
   };
-
-  // UTM keys
-  var utmKeys = ['utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content'];
-
-  // Regex patterns
-  var emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/i;
-  var phoneRegex = /^[\d\s+\-().]{6,20}$/i;
-
-  // Capture UTMs from URL
-  captureUTMs();
 
   function generateId() {
     return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
@@ -49,22 +39,11 @@
     document.cookie = name + "=" + value + expires + "; path=/";
   }
 
-  function captureUTMs() {
+  function extractUTMs() {
     var params = new URLSearchParams(window.location.search);
-    utmKeys.forEach(function(key) {
-      if (params.has(key)) {
-        var value = params.get(key);
-        if (value) {
-          state.utmParams[key] = value.toLowerCase();
-          sessionStorage.setItem('cdp_' + key, value.toLowerCase());
-        }
-      }
-    });
-    // Also restore from session if no new UTMs
-    utmKeys.forEach(function(key) {
-      if (!state.utmParams[key]) {
-        var stored = sessionStorage.getItem('cdp_' + key);
-        if (stored) state.utmParams[key] = stored;
+    ['utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content'].forEach(function(utm) {
+      if (params.get(utm)) {
+        state.utms[utm] = params.get(utm).toLowerCase();
       }
     });
   }
@@ -75,7 +54,8 @@
       url: window.location.href,
       path: window.location.pathname,
       referrer: document.referrer,
-      search: window.location.search
+      search: window.location.search,
+      ...state.utms
     };
     if (overrides) {
       for (var key in overrides) {
@@ -102,54 +82,7 @@
     };
   }
 
-  // Manual fast SHA256 wrapper (no await needed)
-  async function cryptoHash(value) {
-    const encoder = new TextEncoder();
-    const data = encoder.encode(value.toLowerCase().trim());
-    const hashBuffer = await crypto.subtle.digest('SHA-256', data);
-    return Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
-  }
-
-  window.hash = function(value) {
-    var id = "hash_" + generateId().slice(0,6);
-    cryptoHash(value).then(function(result) {
-      sessionStorage.setItem(id, result);
-    });
-    return id;
-  };
-
-  function getHashedValue(id) {
-    return sessionStorage.getItem(id) || id;
-  }
-
-  function sanitizeProperties(properties) {
-    var cleanProps = {};
-
-    for (var key in properties) {
-      if (!properties.hasOwnProperty(key)) continue;
-
-      var value = properties[key];
-
-      if (typeof value === 'string') {
-        value = value.trim();
-        if (config.sensitive_data) {
-          if (emailRegex.test(value)) value = getHashedValue(hash(value));
-          if (phoneRegex.test(value)) value = getHashedValue(hash(value));
-        }
-      }
-
-      cleanProps[key] = value;
-    }
-
-    // Attach UTMs if available
-    if (Object.keys(state.utmParams).length > 0) {
-      cleanProps.utm = state.utmParams;
-    }
-
-    return cleanProps;
-  }
-
-  function send(payload) {
+  async function send(payload) {
     var payloadStr = JSON.stringify(payload);
     if (navigator.sendBeacon) {
       navigator.sendBeacon(config.endpoint, payloadStr);
@@ -165,7 +98,23 @@
     }
   }
 
-  function trackEvent(eventName, properties) {
+  async function sanitizeData(properties) {
+    if (!properties) return;
+
+    for (var key in properties) {
+      if (typeof properties[key] === 'string') {
+        var value = properties[key].trim();
+        if (key.toLowerCase().match(/^(email|e-mail)$/)) {
+          properties[key] = await hash(value.toLowerCase());
+        }
+        if (key.toLowerCase().match(/^(phone|phone_number|phonenumber|mobile|tel)$/)) {
+          properties[key] = await hash(value);
+        }
+      }
+    }
+  }
+
+  async function trackEvent(eventName, properties) {
     var now = new Date().toISOString();
     var pageOverrides = properties && properties._page ? properties._page : null;
     var userOverrides = properties && properties._user ? properties._user : null;
@@ -175,11 +124,15 @@
       delete properties._user;
     }
 
+    if (config.sensitive_data) {
+      await sanitizeData(properties);
+    }
+
     var eventData = {
       event: eventName,
       event_id: generateId(),
       timestamp: now,
-      properties: sanitizeProperties(properties || {}),
+      properties: properties || {},
       user: {
         user_id: userOverrides && userOverrides.user_id ? userOverrides.user_id : state.userId,
         anonymous_id: state.anonymousId
@@ -193,30 +146,30 @@
     };
 
     if (config.anonymize_ip) {
-      eventData.ip_override = "0.0.0.0";
+      eventData.ip = "0.0.0.0";
     }
 
     send(eventData);
   }
 
-  function identifyUser(traits) {
+  async function identifyUser(traits) {
     var now = new Date().toISOString();
     traits = traits || {};
+
+    if (config.sensitive_data) {
+      await sanitizeData(traits);
+    }
 
     var eventData = {
       event: 'identify',
       event_id: generateId(),
       timestamp: now,
-      properties: sanitizeProperties(traits),
+      properties: traits,
       session: {
         id: state.sessionId
       },
       sent_at: now
     };
-
-    if (config.anonymize_ip) {
-      eventData.ip_override = "0.0.0.0";
-    }
 
     send(eventData);
   }
@@ -230,17 +183,28 @@
       }
     }
 
-    var existingAnonymousId = sessionStorage.getItem('cdp_anonymous_id');
+    extractUTMs();
+
+    var existingAnonymousId = getCookie('cdp_anonymous_id');
     if (existingAnonymousId) {
       state.anonymousId = existingAnonymousId;
     } else {
-      sessionStorage.setItem('cdp_anonymous_id', state.anonymousId);
+      setCookie('cdp_anonymous_id', state.anonymousId, config.cookie_expires);
     }
 
-    var existingUserId = sessionStorage.getItem('cdp_user_id');
+    var existingUserId = getCookie('cdp_user_id');
     if (existingUserId) {
       state.userId = existingUserId;
     }
+  }
+
+  async function hash(value) {
+    const encoder = new TextEncoder();
+    const data = encoder.encode(value.trim());
+    const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+    const hashArray = Array.from(new Uint8Array(hashBuffer));
+    const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+    return hashHex;
   }
 
   var cdpQueue = window.cdp.q || [];
@@ -266,6 +230,8 @@
       case 'init':
         init(params[0]);
         break;
+      case 'hash':
+        return hash(params[0]);
       default:
         console.error('Unknown command:', command);
     }
