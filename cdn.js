@@ -12,10 +12,6 @@
         batch_events: false,
         batch_size: 10,
         batch_timeout: 1000,
-        autoTrack: false,
-        trackPageViews: false,
-        trackClicks: false,
-        trackForms: false
     };
 
     var state = {
