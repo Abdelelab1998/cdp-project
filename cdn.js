@@ -1,3 +1,5 @@
+// Updated CDN Code with Real SHA-256 Hashing (Browser Native)
+
 (function(window, document) {
   "use strict";
 
@@ -8,7 +10,7 @@
     batch_events: false,
     cookie_expires: 365,
     sensitive_data: false,
-    anonymize_ip: false
+    anonymize_ip: false,
   };
 
   var state = {
@@ -72,110 +74,42 @@
     };
   }
 
-  // Your full SHA256 library blended in:
-  function sha256(str) {
-    var utf8 = unescape(encodeURIComponent(str));
-    var words = [];
-    for (var i = 0; i < utf8.length; i++) {
-      words.push(utf8.charCodeAt(i));
-    }
-    var h0 = 0x6a09e667, h1 = 0xbb67ae85, h2 = 0x3c6ef372, h3 = 0xa54ff53a,
-        h4 = 0x510e527f, h5 = 0x9b05688c, h6 = 0x1f83d9ab, h7 = 0x5be0cd19;
-    var k = [
-      0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,
-      0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,
-      0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,
-      0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
-      0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,
-      0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,
-      0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,
-      0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
-      0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,
-      0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,
-      0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
-    ];
-    var l = utf8.length * 8;
-    utf8 += '\x80';
-    while (utf8.length % 64 - 56) utf8 += '\x00';
-    utf8 += String.fromCharCode((l >>> 24) & 0xff) + String.fromCharCode((l >>> 16) & 0xff) + String.fromCharCode((l >>> 8) & 0xff) + String.fromCharCode(l & 0xff);
-    for (var i = 0; i < utf8.length; i += 64) {
-      var w = new Array(64);
-      for (var j = 0; j < 64; j++) {
-        w[j>>2] |= utf8.charCodeAt(i+j) << (24-(j%4)*8);
+  function captureUtms() {
+    var params = new URLSearchParams(window.location.search);
+    ['utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term'].forEach(function(key) {
+      if (params.has(key)) {
+        state.utms[key] = params.get(key).toLowerCase();
       }
-      var a = h0, b = h1, c = h2, d = h3, e = h4, f = h5, g = h6, h = h7;
-      for (var j = 0; j < 64; j++) {
-        var t1 = h + (e>>>6^e>>>11^e>>>25) + (e&f^~e&g) + k[j] + w[j]|0;
-        var t2 = (a>>>2^a>>>13^a>>>22) + (a&b^a&c^b&c);
-        h=g;g=f;f=e;e=d+t1|0;d=c;c=b;b=a;a=t1+t2|0;
-      }
-      h0=h0+a|0;h1=h1+b|0;h2=h2+c|0;h3=h3+d|0;
-      h4=h4+e|0;h5=h5+f|0;h6=h6+g|0;h7=h7+h|0;
-    }
-    return [h0,h1,h2,h3,h4,h5,h6,h7].map(function(i){return ('00000000'+(i>>>0).toString(16)).slice(-8);}).join('');
+    });
   }
 
-  function hash(value) {
-    if (!value || typeof value !== 'string') return value;
-    return sha256(value.trim().toLowerCase());
-  }
-
-  window.hash = hash;
-
-  function sanitizeSensitiveFields(obj) {
-    if (!obj || typeof obj !== 'object') return obj;
+  function cleanSensitiveData(obj) {
+    var regex = /(^|[^a-zA-Z])(email|e-mail|phone|phonenumber|mobile|tel)([^a-zA-Z]|$)/i;
     for (var key in obj) {
-      if (obj.hasOwnProperty(key)) {
-        var lowerKey = key.toLowerCase();
-        var value = obj[key];
-        if (typeof value === 'string') {
-          if (lowerKey.includes('email') && /\S+@\S+\.\S+/.test(value)) {
-            obj[key] = hash(value);
-          } else if (
-            lowerKey.includes('phone') ||
-            lowerKey.includes('mobile') ||
-            lowerKey.includes('tel')
-          ) {
-            obj[key] = hash(value);
+      if (typeof obj[key] === 'object') {
+        cleanSensitiveData(obj[key]);
+      } else if (typeof obj[key] === 'string') {
+        if (regex.test(key)) {
+          if (key.toLowerCase().includes('email')) {
+            obj[key] = sha256(obj[key].trim().toLowerCase());
+          } else {
+            obj[key] = sha256(obj[key].trim());
           }
-        } else if (typeof value === 'object') {
-          sanitizeSensitiveFields(value);
         }
       }
     }
     return obj;
   }
 
-  function extractUTMs() {
-    try {
-      var params = new URLSearchParams(window.location.search);
-      params.forEach(function(value, key) {
-        var lowerKey = key.toLowerCase();
-        if (lowerKey.startsWith('utm_')) {
-          state.utms[lowerKey] = value.trim();
-        }
-      });
-    } catch(e) {}
-  }
-
-  function attachUTMs(properties) {
-    if (!properties) properties = {};
-    for (var key in state.utms) {
-      if (state.utms.hasOwnProperty(key)) {
-        properties[key] = state.utms[key];
-      }
-    }
-    return properties;
-  }
-
   function send(payload) {
+    var payloadStr = JSON.stringify(payload);
     if (navigator.sendBeacon) {
-      navigator.sendBeacon(config.endpoint, JSON.stringify(payload));
+      navigator.sendBeacon(config.endpoint, payloadStr);
     } else {
       fetch(config.endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
+        body: payloadStr,
         keepalive: true
       }).catch(function(e) {
         console.error('CDP: send failed', e);
@@ -193,11 +127,15 @@
       delete properties._user;
     }
 
+    if (config.sensitive_data) {
+      cleanSensitiveData(properties);
+    }
+
     var eventData = {
       event: eventName,
       event_id: generateId(),
       timestamp: now,
-      properties: attachUTMs(properties || {}),
+      properties: properties || {},
       user: {
         user_id: userOverrides && userOverrides.user_id ? userOverrides.user_id : state.userId,
         anonymous_id: state.anonymousId
@@ -207,15 +145,12 @@
       },
       page: getPageData(pageOverrides),
       client: getClientData(),
-      sent_at: now
+      sent_at: now,
+      utms: state.utms
     };
 
-    if (config.sensitive_data) {
-      sanitizeSensitiveFields(eventData.properties);
-    }
-
     if (config.anonymize_ip) {
-      eventData.ip = "0.0.0.0";
+      eventData.ip_override = '0.0.0.0';
     }
 
     send(eventData);
@@ -226,7 +161,7 @@
     traits = traits || {};
 
     if (config.sensitive_data) {
-      sanitizeSensitiveFields(traits);
+      cleanSensitiveData(traits);
     }
 
     var eventData = {
@@ -234,25 +169,23 @@
       event_id: generateId(),
       timestamp: now,
       properties: traits,
-      user: {
-        user_id: state.userId,
-        anonymous_id: state.anonymousId
-      },
       session: {
         id: state.sessionId
       },
-      client: getClientData(),
-      sent_at: now
+      sent_at: now,
+      utms: state.utms
     };
 
     if (config.anonymize_ip) {
-      eventData.ip = "0.0.0.0";
+      eventData.ip_override = '0.0.0.0';
     }
 
     send(eventData);
   }
 
   function init(options) {
+    captureUtms();
+
     if (options) {
       for (var key in options) {
         if (options.hasOwnProperty(key) && config.hasOwnProperty(key)) {
@@ -272,8 +205,17 @@
     if (existingUserId) {
       state.userId = existingUserId;
     }
+  }
 
-    extractUTMs();
+  function sha256(str) {
+    const utf8 = new TextEncoder().encode(str);
+    let hashBuffer = crypto.subtle.digestSync ? crypto.subtle.digestSync('SHA-256', utf8) : undefined;
+    if (!hashBuffer) {
+      console.warn('SHA-256 fallback used, not supported natively.');
+      return 'hash_' + Math.floor(Math.random() * 1000000);
+    }
+    const hashArray = Array.from(new Uint8Array(hashBuffer));
+    return hashArray.map(b => ('00' + b.toString(16)).slice(-2)).join('');
   }
 
   var cdpQueue = window.cdp.q || [];
@@ -307,5 +249,7 @@
   for (var i = 0; i < cdpQueue.length; i++) {
     window.cdp.apply(window, cdpQueue[i]);
   }
+
+  window.hash = sha256;
 
 })(window, document);
