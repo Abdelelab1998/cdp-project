@@ -115,25 +115,35 @@
     send(eventData);
   }
 
-  function identifyUser(traits) {
-    var now = new Date().toISOString();
-    var eventData = {
-      event: 'identify',
-      event_id: generateId(),
-      timestamp: now,
-      properties: traits || {},
-      user: {
-        user_id: state.userId,
-        anonymous_id: state.anonymousId
-      },
-      session: {
-        id: state.sessionId
-      },
-      sent_at: now
-    };
+function identifyUser(traits) {
+  var now = new Date().toISOString();
+  traits = traits || {};
 
-    send(eventData);
+  // Check for _user override
+  if (traits._user) {
+    if (traits._user.user_id) {
+      state.userId = traits._user.user_id;
+    }
+    delete traits._user;
   }
+
+  var eventData = {
+    event: 'identify',
+    event_id: generateId(),
+    timestamp: now,
+    properties: traits,
+    user: {
+      user_id: state.userId,
+      anonymous_id: state.anonymousId
+    },
+    session: {
+      id: state.sessionId
+    },
+    sent_at: now
+  };
+
+  send(eventData);
+}
 
   function init(options) {
     if (options) {
