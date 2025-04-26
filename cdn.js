@@ -1,22 +1,27 @@
 (function(window, document) {
   "use strict";
 
+  // Initialize CDP global object
   window.cdp = window.cdp || {};
 
   var config = {
     endpoint: window.cdp.endpoint || 'https://your-server-endpoint.com/collect',
     batch_events: false,
     cookie_expires: 365,
-    anonymize_ip: false,
     sensitive_data: false,
+    anonymize_ip: false,
   };
 
   var state = {
     userId: null,
     anonymousId: generateId(),
-    sessionId: generateId(),
-    utms: {} // Store UTM params
+    sessionId: generateId()
   };
+
+  // In-memory cache for hash results
+  var hashStore = {};
+
+  // --- Utilities ---
 
   function generateId() {
     return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
@@ -24,19 +29,6 @@
       return v.toString(16);
     });
   }
-
-  function sha256(str) {
-    var utf8 = new TextEncoder().encode(str.toLowerCase().trim());
-    return crypto.subtle.digest('SHA-256', utf8).then(function(buffer) {
-      var hashArray = Array.from(new Uint8Array(buffer));
-      return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-    });
-  }
-
-  window.hash = function(input) {
-    input = (input || '').toLowerCase().trim();
-    return sha256(input);
-  };
 
   function getCookie(name) {
     var value = "; " + document.cookie;
@@ -52,6 +44,67 @@
     document.cookie = name + "=" + value + expires + "; path=/";
   }
 
+  function getUtmData() {
+    var utmKeys = ['utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content'];
+    var storedUtm = JSON.parse(sessionStorage.getItem('cdp_utms') || '{}');
+    var params = new URLSearchParams(window.location.search);
+    var updated = false;
+
+    utmKeys.forEach(function(key) {
+      if (params.has(key)) {
+        storedUtm[key] = params.get(key) || '';
+        updated = true;
+      }
+    });
+
+    if (updated) {
+      sessionStorage.setItem('cdp_utms', JSON.stringify(storedUtm));
+    }
+
+    return storedUtm;
+  }
+
+  function sanitizeSensitive(obj) {
+    if (!config.sensitive_data) return;
+
+    function hashField(value) {
+      if (!value) return value;
+      return window.hash(value);
+    }
+
+    function deepSanitize(o) {
+      for (var key in o) {
+        if (!o.hasOwnProperty(key)) continue;
+        var lowerKey = key.toLowerCase();
+        if (lowerKey.indexOf('email') !== -1 || lowerKey.indexOf('phone') !== -1 || lowerKey.indexOf('mobile') !== -1 || lowerKey.indexOf('tel') !== -1) {
+          o[key] = hashField(o[key]);
+        } else if (typeof o[key] === 'object') {
+          deepSanitize(o[key]);
+        }
+      }
+    }
+
+    deepSanitize(obj);
+  }
+
+  function send(payload) {
+    sanitizeSensitive(payload);
+
+    var payloadStr = JSON.stringify(payload);
+    if (navigator.sendBeacon) {
+      navigator.sendBeacon(config.endpoint, payloadStr);
+    } else {
+      fetch(config.endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: payloadStr,
+        keepalive: true
+      }).catch(function(e) {
+        console.error('CDP: send failed', e);
+      });
+    }
+  }
+
   function getPageData(overrides) {
     var defaults = {
       title: document.title,
@@ -60,6 +113,7 @@
       referrer: document.referrer,
       search: window.location.search
     };
+
     if (overrides) {
       for (var key in overrides) {
         if (overrides.hasOwnProperty(key) && defaults.hasOwnProperty(key)) {
@@ -67,6 +121,7 @@
         }
       }
     }
+
     return defaults;
   }
 
@@ -85,46 +140,6 @@
     };
   }
 
-  function sanitizeSensitive(data) {
-    for (var key in data) {
-      if (!data.hasOwnProperty(key)) continue;
-      var lower = key.toLowerCase();
-      if ((lower.includes('email') || lower.includes('e-mail')) && data[key]) {
-        data[key] = sha256(data[key]);
-      }
-      if ((lower.includes('phone') || lower.includes('mobile') || lower.includes('tel')) && data[key]) {
-        data[key] = sha256(data[key]);
-      }
-    }
-    return data;
-  }
-
-  function getUTMs() {
-    var stored = sessionStorage.getItem('cdp_utms');
-    if (stored) {
-      try {
-        return JSON.parse(stored);
-      } catch (e) {}
-    }
-    return {};
-  }
-
-  function send(payload) {
-    var payloadStr = JSON.stringify(payload);
-    if (navigator.sendBeacon) {
-      navigator.sendBeacon(config.endpoint, payloadStr);
-    } else {
-      fetch(config.endpoint, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: payloadStr,
-        keepalive: true
-      }).catch(function(e) {
-        console.error('CDP: send failed', e);
-      });
-    }
-  }
-
   function trackEvent(eventName, properties) {
     var now = new Date().toISOString();
     var pageOverrides = properties && properties._page ? properties._page : null;
@@ -135,16 +150,12 @@
       delete properties._user;
     }
 
-    if (config.sensitive_data) {
-      properties = sanitizeSensitive(properties);
-    }
-
-    var eventData = {
+    var payload = {
       event: eventName,
       event_id: generateId(),
       timestamp: now,
       properties: properties || {},
-      utm: state.utms || {},
+      utm: getUtmData(),
       user: {
         user_id: userOverrides && userOverrides.user_id ? userOverrides.user_id : state.userId,
         anonymous_id: state.anonymousId
@@ -158,31 +169,38 @@
     };
 
     if (config.anonymize_ip) {
-      eventData.client.ip = '0.0.0.0';
+      payload.ip = "0.0.0.0";
     }
 
-    send(eventData);
+    send(payload);
   }
 
   function identifyUser(traits) {
     var now = new Date().toISOString();
+    traits = traits || {};
 
-    if (config.sensitive_data) {
-      traits = sanitizeSensitive(traits);
-    }
-
-    var eventData = {
+    var payload = {
       event: 'identify',
       event_id: generateId(),
       timestamp: now,
-      properties: traits || {},
+      properties: traits,
+      utm: getUtmData(),
+      user: {
+        user_id: state.userId,
+        anonymous_id: state.anonymousId
+      },
       session: {
         id: state.sessionId
       },
+      client: getClientData(),
       sent_at: now
     };
 
-    send(eventData);
+    if (config.anonymize_ip) {
+      payload.ip = "0.0.0.0";
+    }
+
+    send(payload);
   }
 
   function init(options) {
@@ -205,10 +223,9 @@
     if (existingUserId) {
       state.userId = existingUserId;
     }
-
-    state.utms = getUTMs();
   }
 
+  // Public API
   var cdpQueue = window.cdp.q || [];
   window.cdp = function() {
     var args = Array.prototype.slice.call(arguments);
@@ -240,5 +257,22 @@
   for (var i = 0; i < cdpQueue.length; i++) {
     window.cdp.apply(window, cdpQueue[i]);
   }
+
+  // Hash function exposed to global window
+  window.hash = function(str) {
+    str = (str || '').toLowerCase().trim();
+    if (hashStore[str]) return hashStore[str];
+
+    var utf8 = new TextEncoder().encode(str);
+    crypto.subtle.digest('SHA-256', utf8).then(function(buffer) {
+      var hashArray = Array.from(new Uint8Array(buffer));
+      var hashed = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+      hashStore[str] = hashed;
+    }).catch(function() {
+      hashStore[str] = 'hash_error';
+    });
+
+    return str;
+  };
 
 })(window, document);
