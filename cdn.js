@@ -1,41 +1,21 @@
 (function(window, document) {
   "use strict";
 
-  // --- Real SHA-256 hash function (blended)
-  var hashStore = {};
-  function hash(input) {
-    input = (input || '').toLowerCase().trim();
-    if (hashStore[input]) return hashStore[input];
-
-    var utf8 = new TextEncoder().encode(input);
-    crypto.subtle.digest('SHA-256', utf8).then(function(buffer) {
-      var hashArray = Array.from(new Uint8Array(buffer));
-      var hashed = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-      hashStore[input] = hashed;
-    }).catch(function() {
-      hashStore[input] = 'hash_error';
-    });
-
-    return input; // Immediate fallback until real hash is ready
-  }
-  window.hash = hash;
-
-  // --- Main CDP code
-
   window.cdp = window.cdp || {};
 
   var config = {
     endpoint: window.cdp.endpoint || 'https://your-server-endpoint.com/collect',
     batch_events: false,
     cookie_expires: 365,
+    anonymize_ip: false,
     sensitive_data: false,
-    anonymize_ip: false
   };
 
   var state = {
     userId: null,
     anonymousId: generateId(),
     sessionId: generateId(),
+    utms: {} // Store UTM params
   };
 
   function generateId() {
@@ -44,6 +24,19 @@
       return v.toString(16);
     });
   }
+
+  function sha256(str) {
+    var utf8 = new TextEncoder().encode(str.toLowerCase().trim());
+    return crypto.subtle.digest('SHA-256', utf8).then(function(buffer) {
+      var hashArray = Array.from(new Uint8Array(buffer));
+      return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+    });
+  }
+
+  window.hash = function(input) {
+    input = (input || '').toLowerCase().trim();
+    return sha256(input);
+  };
 
   function getCookie(name) {
     var value = "; " + document.cookie;
@@ -92,31 +85,42 @@
     };
   }
 
-  function sanitizeSensitive(properties) {
-    if (!properties || typeof properties !== 'object') return;
-
-    for (var key in properties) {
-      if (!properties.hasOwnProperty(key)) continue;
-      var v = properties[key];
-      if (typeof v === 'string') {
-        if (/(email|e-mail)/i.test(key)) properties[key] = hash(v);
-        if (/(phone|mobile|tel)/i.test(key)) properties[key] = hash(v);
+  function sanitizeSensitive(data) {
+    for (var key in data) {
+      if (!data.hasOwnProperty(key)) continue;
+      var lower = key.toLowerCase();
+      if ((lower.includes('email') || lower.includes('e-mail')) && data[key]) {
+        data[key] = sha256(data[key]);
       }
-      if (typeof v === 'object') sanitizeSensitive(v);
+      if ((lower.includes('phone') || lower.includes('mobile') || lower.includes('tel')) && data[key]) {
+        data[key] = sha256(data[key]);
+      }
     }
+    return data;
+  }
+
+  function getUTMs() {
+    var stored = sessionStorage.getItem('cdp_utms');
+    if (stored) {
+      try {
+        return JSON.parse(stored);
+      } catch (e) {}
+    }
+    return {};
   }
 
   function send(payload) {
+    var payloadStr = JSON.stringify(payload);
     if (navigator.sendBeacon) {
-      navigator.sendBeacon(config.endpoint, JSON.stringify(payload));
+      navigator.sendBeacon(config.endpoint, payloadStr);
     } else {
       fetch(config.endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
+        body: payloadStr,
         keepalive: true
       }).catch(function(e) {
-        console.error('CDP send failed', e);
+        console.error('CDP: send failed', e);
       });
     }
   }
@@ -131,13 +135,16 @@
       delete properties._user;
     }
 
-    if (config.sensitive_data) sanitizeSensitive(properties);
+    if (config.sensitive_data) {
+      properties = sanitizeSensitive(properties);
+    }
 
     var eventData = {
       event: eventName,
       event_id: generateId(),
       timestamp: now,
       properties: properties || {},
+      utm: state.utms || {},
       user: {
         user_id: userOverrides && userOverrides.user_id ? userOverrides.user_id : state.userId,
         anonymous_id: state.anonymousId
@@ -150,20 +157,25 @@
       sent_at: now
     };
 
+    if (config.anonymize_ip) {
+      eventData.client.ip = '0.0.0.0';
+    }
+
     send(eventData);
   }
 
   function identifyUser(traits) {
     var now = new Date().toISOString();
-    traits = traits || {};
 
-    if (config.sensitive_data) sanitizeSensitive(traits);
+    if (config.sensitive_data) {
+      traits = sanitizeSensitive(traits);
+    }
 
     var eventData = {
       event: 'identify',
       event_id: generateId(),
       timestamp: now,
-      properties: traits,
+      properties: traits || {},
       session: {
         id: state.sessionId
       },
@@ -193,6 +205,8 @@
     if (existingUserId) {
       state.userId = existingUserId;
     }
+
+    state.utms = getUTMs();
   }
 
   var cdpQueue = window.cdp.q || [];
