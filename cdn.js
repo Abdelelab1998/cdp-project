@@ -87,19 +87,27 @@
 
   function trackEvent(eventName, properties) {
     var now = new Date().toISOString();
+    var pageOverrides = properties && properties._page ? properties._page : null;
+    var userOverrides = properties && properties._user ? properties._user : null;
+
+    if (properties) {
+      delete properties._page;
+      delete properties._user;
+    }
+
     var eventData = {
       event: eventName,
       event_id: generateId(),
       timestamp: now,
       properties: properties || {},
       user: {
-        user_id: state.userId,
+        user_id: userOverrides && userOverrides.user_id ? userOverrides.user_id : state.userId,
         anonymous_id: state.anonymousId
       },
       session: {
         id: state.sessionId
       },
-      page: getPageData(properties && properties._page),
+      page: getPageData(pageOverrides),
       client: getClientData(),
       sent_at: now
     };
