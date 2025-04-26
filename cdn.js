@@ -184,7 +184,7 @@
       event_id: generateId(),
       timestamp: now,
       properties: traits,
-      },
+      utm: getUtmData(),
       client: getClientData(),
       sent_at: now
     };
