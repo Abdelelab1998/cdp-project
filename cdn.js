@@ -188,14 +188,6 @@
       event_id: generateId(),
       timestamp: now,
       properties: sanitizeData(traits || {}),
-      utms: state.utms,
-      user: {
-        user_id: state.userId,
-        anonymous_id: state.anonymousId
-      },
-      session: {
-        id: state.sessionId
-      },
       sent_at: now
     };
 
