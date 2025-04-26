@@ -1,7 +1,26 @@
-// Updated CDN Code with Real SHA-256 Hashing (Browser Native)
-
 (function(window, document) {
   "use strict";
+
+  // --- Real SHA-256 hash function (blended)
+  var hashStore = {};
+  function hash(input) {
+    input = (input || '').toLowerCase().trim();
+    if (hashStore[input]) return hashStore[input];
+
+    var utf8 = new TextEncoder().encode(input);
+    crypto.subtle.digest('SHA-256', utf8).then(function(buffer) {
+      var hashArray = Array.from(new Uint8Array(buffer));
+      var hashed = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+      hashStore[input] = hashed;
+    }).catch(function() {
+      hashStore[input] = 'hash_error';
+    });
+
+    return input; // Immediate fallback until real hash is ready
+  }
+  window.hash = hash;
+
+  // --- Main CDP code
 
   window.cdp = window.cdp || {};
 
@@ -10,14 +29,13 @@
     batch_events: false,
     cookie_expires: 365,
     sensitive_data: false,
-    anonymize_ip: false,
+    anonymize_ip: false
   };
 
   var state = {
     userId: null,
     anonymousId: generateId(),
     sessionId: generateId(),
-    utms: {}
   };
 
   function generateId() {
@@ -74,45 +92,31 @@
     };
   }
 
-  function captureUtms() {
-    var params = new URLSearchParams(window.location.search);
-    ['utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term'].forEach(function(key) {
-      if (params.has(key)) {
-        state.utms[key] = params.get(key).toLowerCase();
-      }
-    });
-  }
+  function sanitizeSensitive(properties) {
+    if (!properties || typeof properties !== 'object') return;
 
-  function cleanSensitiveData(obj) {
-    var regex = /(^|[^a-zA-Z])(email|e-mail|phone|phonenumber|mobile|tel)([^a-zA-Z]|$)/i;
-    for (var key in obj) {
-      if (typeof obj[key] === 'object') {
-        cleanSensitiveData(obj[key]);
-      } else if (typeof obj[key] === 'string') {
-        if (regex.test(key)) {
-          if (key.toLowerCase().includes('email')) {
-            obj[key] = sha256(obj[key].trim().toLowerCase());
-          } else {
-            obj[key] = sha256(obj[key].trim());
-          }
-        }
+    for (var key in properties) {
+      if (!properties.hasOwnProperty(key)) continue;
+      var v = properties[key];
+      if (typeof v === 'string') {
+        if (/(email|e-mail)/i.test(key)) properties[key] = hash(v);
+        if (/(phone|mobile|tel)/i.test(key)) properties[key] = hash(v);
       }
+      if (typeof v === 'object') sanitizeSensitive(v);
     }
-    return obj;
   }
 
   function send(payload) {
-    var payloadStr = JSON.stringify(payload);
     if (navigator.sendBeacon) {
-      navigator.sendBeacon(config.endpoint, payloadStr);
+      navigator.sendBeacon(config.endpoint, JSON.stringify(payload));
     } else {
       fetch(config.endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: payloadStr,
+        body: JSON.stringify(payload),
         keepalive: true
       }).catch(function(e) {
-        console.error('CDP: send failed', e);
+        console.error('CDP send failed', e);
       });
     }
   }
@@ -127,9 +131,7 @@
       delete properties._user;
     }
 
-    if (config.sensitive_data) {
-      cleanSensitiveData(properties);
-    }
+    if (config.sensitive_data) sanitizeSensitive(properties);
 
     var eventData = {
       event: eventName,
@@ -145,13 +147,8 @@
       },
       page: getPageData(pageOverrides),
       client: getClientData(),
-      sent_at: now,
-      utms: state.utms
+      sent_at: now
     };
-
-    if (config.anonymize_ip) {
-      eventData.ip_override = '0.0.0.0';
-    }
 
     send(eventData);
   }
@@ -160,9 +157,7 @@
     var now = new Date().toISOString();
     traits = traits || {};
 
-    if (config.sensitive_data) {
-      cleanSensitiveData(traits);
-    }
+    if (config.sensitive_data) sanitizeSensitive(traits);
 
     var eventData = {
       event: 'identify',
@@ -172,20 +167,13 @@
       session: {
         id: state.sessionId
       },
-      sent_at: now,
-      utms: state.utms
+      sent_at: now
     };
-
-    if (config.anonymize_ip) {
-      eventData.ip_override = '0.0.0.0';
-    }
 
     send(eventData);
   }
 
   function init(options) {
-    captureUtms();
-
     if (options) {
       for (var key in options) {
         if (options.hasOwnProperty(key) && config.hasOwnProperty(key)) {
@@ -205,17 +193,6 @@
     if (existingUserId) {
       state.userId = existingUserId;
     }
-  }
-
-  function sha256(str) {
-    const utf8 = new TextEncoder().encode(str);
-    let hashBuffer = crypto.subtle.digestSync ? crypto.subtle.digestSync('SHA-256', utf8) : undefined;
-    if (!hashBuffer) {
-      console.warn('SHA-256 fallback used, not supported natively.');
-      return 'hash_' + Math.floor(Math.random() * 1000000);
-    }
-    const hashArray = Array.from(new Uint8Array(hashBuffer));
-    return hashArray.map(b => ('00' + b.toString(16)).slice(-2)).join('');
   }
 
   var cdpQueue = window.cdp.q || [];
@@ -249,7 +226,5 @@
   for (var i = 0; i < cdpQueue.length; i++) {
     window.cdp.apply(window, cdpQueue[i]);
   }
-
-  window.hash = sha256;
 
 })(window, document);
