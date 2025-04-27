@@ -4,7 +4,7 @@
   window.cdp = window.cdp || {};
 
   var config = {
-    endpoint: window.cdp.endpoint || 'https://your-server-endpoint.com/collect',
+    endpoint: window.cdp.endpoint,
     batch_events: false,
     batch_size: 10,
     batch_timeout: 2000,
