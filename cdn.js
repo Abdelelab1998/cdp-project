@@ -6,14 +6,29 @@
   var config = {
     endpoint: window.cdp.endpoint || 'https://your-server-endpoint.com/collect',
     batch_events: false,
-    cookie_expires: 365
+    batch_size: 10,
+    batch_timeout: 2000,
+    cookie_expires: 365,
+    cross_domain: {
+      enabled: false,
+      domains: []
+    },
+    sensitive_data: {
+      auto_hash: false,
+      patterns: {
+        email: /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/,
+        phone: /^\+?[0-9]{10,15}$/
+      }
+    }
   };
 
   var state = {
     userId: null,
     anonymousId: generateId(),
     sessionId: generateId(),
-    utmParams: {} // Store UTM parameters
+    utmParams: {}, // Store UTM parameters
+    eventQueue: [], // Store events for batching
+    batchTimerId: null // Timer for batch sending
   };
 
   function generateId() {
@@ -23,11 +38,9 @@
     });
   }
 
-  // Use a synchronous hashing function instead of the async Web Crypto
+  // Use a synchronous hashing function for SHA-256
   function sha256Sync(str) {
     // This is a JavaScript implementation of SHA-256
-    // Source: https://geraintluff.github.io/sha256/
-
     var SHA256 = function(s) {
       var chrsz = 8;
       var hexcase = 0;
@@ -243,7 +256,179 @@
     return state.utmParams;
   }
 
+  function detectAndHashSensitiveData(obj) {
+    // If auto_hash is disabled, return the original object
+    if (!config.sensitive_data.auto_hash) {
+      return obj;
+    }
+    
+    // If input isn't an object or is null, return as is
+    if (!obj || typeof obj !== 'object') {
+      return obj;
+    }
+    
+    // Process arrays recursively
+    if (Array.isArray(obj)) {
+      return obj.map(item => detectAndHashSensitiveData(item));
+    }
+    
+    // Create new object to avoid modifying the original
+    var result = {};
+    
+    // Iterate through object properties
+    for (var key in obj) {
+      if (obj.hasOwnProperty(key)) {
+        var value = obj[key];
+        
+        // If value is an object (including arrays), process recursively
+        if (value !== null && typeof value === 'object') {
+          result[key] = detectAndHashSensitiveData(value);
+        }
+        // If value is a string, check for sensitive patterns
+        else if (typeof value === 'string') {
+          // Check if it matches email pattern
+          if (config.sensitive_data.patterns.email.test(value)) {
+            result[key] = sha256Sync(value);
+          }
+          // Check if it matches phone pattern
+          else if (config.sensitive_data.patterns.phone.test(value)) {
+            result[key] = sha256Sync(value);
+          }
+          // Otherwise keep the original value
+          else {
+            result[key] = value;
+          }
+        }
+        // For non-strings, keep as is
+        else {
+          result[key] = value;
+        }
+      }
+    }
+    
+    return result;
+  }
+
+  function syncCrossDomainId() {
+    if (!config.cross_domain.enabled || !config.cross_domain.domains.length) return;
+    
+    try {
+      // Create a hidden iframe to sync cookies across domains
+      var iframe = document.createElement('iframe');
+      iframe.style.display = 'none';
+      iframe.src = createSyncUrl();
+      document.body.appendChild(iframe);
+      
+      // Remove iframe after sync attempt
+      setTimeout(function() {
+        if (iframe && iframe.parentNode) {
+          iframe.parentNode.removeChild(iframe);
+        }
+      }, 2000);
+    } catch (e) {
+      console.error('CDP: Cross-domain sync failed', e);
+    }
+  }
+  
+  function createSyncUrl() {
+    // Find a domain different from current one to sync with
+    var currentDomain = window.location.hostname;
+    var targetDomain = '';
+    
+    for (var i = 0; i < config.cross_domain.domains.length; i++) {
+      if (config.cross_domain.domains[i] !== currentDomain) {
+        targetDomain = config.cross_domain.domains[i];
+        break;
+      }
+    }
+    
+    if (!targetDomain) return '';
+    
+    // Create sync URL with user and session IDs
+    return 'https://' + targetDomain + '/cdp-sync.html' + 
+           '?anonymous_id=' + encodeURIComponent(state.anonymousId) + 
+           '&session_id=' + encodeURIComponent(state.sessionId) + 
+           (state.userId ? '&user_id=' + encodeURIComponent(state.userId) : '');
+  }
+  
+  function processSyncParams() {
+    // Check if the URL has sync parameters
+    var params = new URLSearchParams(window.location.search);
+    var syncAnonymousId = params.get('anonymous_id');
+    var syncSessionId = params.get('session_id');
+    var syncUserId = params.get('user_id');
+    
+    if (syncAnonymousId) {
+      state.anonymousId = syncAnonymousId;
+      setCookie('cdp_anonymous_id', syncAnonymousId, config.cookie_expires);
+    }
+    
+    if (syncSessionId) {
+      state.sessionId = syncSessionId;
+      setCookie('cdp_session_id', syncSessionId, config.cookie_expires);
+    }
+    
+    if (syncUserId) {
+      state.userId = syncUserId;
+      setCookie('cdp_user_id', syncUserId, config.cookie_expires);
+    }
+  }
+
   function send(payload) {
+    // If batching is enabled, add to queue
+    if (config.batch_events) {
+      state.eventQueue.push(payload);
+      
+      // If we've reached batch size, send immediately
+      if (state.eventQueue.length >= config.batch_size) {
+        sendBatch();
+      } else if (!state.batchTimerId) {
+        // Otherwise set a timer to send batch after timeout
+        state.batchTimerId = setTimeout(sendBatch, config.batch_timeout);
+      }
+    } else {
+      // Otherwise send immediately
+      sendSingle(payload);
+    }
+  }
+
+  function sendBatch() {
+    if (state.eventQueue.length === 0) return;
+    
+    // Clear any existing timer
+    if (state.batchTimerId) {
+      clearTimeout(state.batchTimerId);
+      state.batchTimerId = null;
+    }
+    
+    // Get events to send
+    var events = state.eventQueue;
+    state.eventQueue = [];
+    
+    // Create batch payload
+    var batchPayload = {
+      batch: events,
+      sent_at: new Date().toISOString()
+    };
+    
+    var payloadStr = JSON.stringify(batchPayload);
+    
+    // Send the batch
+    if (navigator.sendBeacon) {
+      navigator.sendBeacon(config.endpoint, payloadStr);
+    } else {
+      fetch(config.endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: payloadStr,
+        keepalive: true
+      }).catch(function(e) {
+        console.error('CDP: batch send failed', e);
+      });
+    }
+  }
+  
+  function sendSingle(payload) {
     var payloadStr = JSON.stringify(payload);
     if (navigator.sendBeacon) {
       navigator.sendBeacon(config.endpoint, payloadStr);
@@ -259,11 +444,6 @@
     }
   }
 
-  // Remove this unused function as we're now using synchronous hashing
-  function processObjectFields(obj) {
-    return obj;
-  }
-
   function trackEvent(eventName, properties) {
     var now = new Date().toISOString();
     var pageOverrides = properties && properties._page ? properties._page : null;
@@ -275,6 +455,9 @@
     }
 
     properties = properties || {};
+
+    // Apply automatic sensitive data hashing if enabled
+    properties = detectAndHashSensitiveData(properties);
 
     // Get UTM parameters
     var utmParams = getUtmParams();
@@ -304,24 +487,21 @@
     send(eventData);
   }
 
-  async function identifyUser(traits) {
+  function identifyUser(traits) {
     var now = new Date().toISOString();
     traits = traits || {};
 
-    // Hash sensitive fields in traits
-    var processedTraits = await processObjectFields(traits);
+    // Apply automatic sensitive data hashing if enabled
+    traits = detectAndHashSensitiveData(traits);
 
-    // Attach UTM parameters
+    // Get UTM parameters
     var utmParams = getUtmParams();
-    if (Object.keys(utmParams).length > 0) {
-      processedTraits.utm = utmParams;
-    }
 
     var eventData = {
       event: 'identify',
       event_id: generateId(),
       timestamp: now,
-      properties: processedTraits,
+      properties: traits,
       user: {
         user_id: traits.user_id || state.userId,
         anonymous_id: state.anonymousId
@@ -331,6 +511,11 @@
       },
       sent_at: now
     };
+
+    // Add UTM parameters as a top-level object if they exist
+    if (Object.keys(utmParams).length > 0) {
+      eventData.utm = utmParams;
+    }
 
     // If user_id is provided, update state and cookie
     if (traits.user_id) {
@@ -361,13 +546,33 @@
     if (existingUserId) {
       state.userId = existingUserId;
     }
+    
+    var existingSessionId = getCookie('cdp_session_id');
+    if (existingSessionId) {
+      state.sessionId = existingSessionId;
+    } else {
+      setCookie('cdp_session_id', state.sessionId, config.cookie_expires);
+    }
 
     // Extract UTM parameters from URL on initialization
     extractUtmParams();
+    
+    // Process cross-domain sync parameters if present
+    processSyncParams();
+    
+    // If cross-domain tracking is enabled, sync IDs with other domains
+    if (config.cross_domain.enabled) {
+      // Delay sync to ensure the page has loaded
+      setTimeout(syncCrossDomainId, 1000);
+    }
+    
+    // Set up beforeunload handler to flush any queued events when the page unloads
+    window.addEventListener('beforeunload', function() {
+      if (state.eventQueue.length > 0) {
+        sendBatch();
+      }
+    });
   }
-
-  // Create a hash function that can be exposed to users
-  window.cdp.hash = sha256Sync;
 
   var cdpQueue = window.cdp.q || [];
   window.cdp = function() {
@@ -384,8 +589,31 @@
         break;
       case 'config':
         for (var key in params[0]) {
-          if (params[0].hasOwnProperty(key) && config.hasOwnProperty(key)) {
-            config[key] = params[0][key];
+          if (params[0].hasOwnProperty(key)) {
+            if (key === 'cross_domain') {
+              // Handle cross_domain config object
+              if (typeof params[0][key] === 'object') {
+                if (params[0][key].hasOwnProperty('enabled')) {
+                  config.cross_domain.enabled = !!params[0][key].enabled;
+                }
+                if (params[0][key].hasOwnProperty('domains') && Array.isArray(params[0][key].domains)) {
+                  config.cross_domain.domains = params[0][key].domains;
+                }
+                // If enabling cross domain with domains, trigger sync
+                if (config.cross_domain.enabled && config.cross_domain.domains.length > 0) {
+                  syncCrossDomainId();
+                }
+              }
+            } else if (key === 'sensitive_data') {
+              // Handle sensitive_data config object
+              if (typeof params[0][key] === 'object') {
+                if (params[0][key].hasOwnProperty('auto_hash')) {
+                  config.sensitive_data.auto_hash = !!params[0][key].auto_hash;
+                }
+              }
+            } else if (config.hasOwnProperty(key)) {
+              config[key] = params[0][key];
+            }
           }
         }
         break;
@@ -394,6 +622,12 @@
         break;
       case 'hash':
         return sha256Sync(params[0]);
+      case 'flushQueue':
+        // Force send any queued events
+        if (state.eventQueue.length > 0) {
+          sendBatch();
+        }
+        break;
       default:
         console.error('Unknown command:', command);
     }
@@ -402,6 +636,7 @@
   // Make hash function available through the cdp object
   window.cdp.hash = sha256Sync;
 
+  // Process any commands that were queued before the script loaded
   for (var i = 0; i < cdpQueue.length; i++) {
     window.cdp.apply(window, cdpQueue[i]);
   }
