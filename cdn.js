@@ -4,7 +4,7 @@
   window.cdp = window.cdp || {};
 
   var config = {
-    endpoint: window.cdp.endpoint,
+    endpoint: window.cdp.endpoint || 'https://your-server-endpoint.com/collect',
     batch_events: false,
     batch_size: 10,
     batch_timeout: 2000,
@@ -527,6 +527,7 @@
   }
 
   function init(options) {
+    // Apply any provided options to configuration
     if (options) {
       for (var key in options) {
         if (options.hasOwnProperty(key) && config.hasOwnProperty(key)) {
@@ -535,6 +536,7 @@
       }
     }
 
+    // Initialize user identification
     var existingAnonymousId = getCookie('cdp_anonymous_id');
     if (existingAnonymousId) {
       state.anonymousId = existingAnonymousId;
@@ -618,7 +620,8 @@
         }
         break;
       case 'init':
-        init(params[0]);
+        // init should be called with minimal or no options
+        init(params[0] || {});
         break;
       case 'hash':
         return sha256Sync(params[0]);
