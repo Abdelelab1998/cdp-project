@@ -165,9 +165,13 @@
   }
 
   function setCookie(name, value, days) {
-    var date = new Date();
-    date.setTime(date.getTime() + (days * 24 * 60 * 60 * 1000));
-    var expires = "; expires=" + date.toUTCString();
+    var expires = "";
+    // Session ID should not have expiration (session cookie)
+    if (days && name !== 'cdp_session_id') {
+      var date = new Date();
+      date.setTime(date.getTime() + (days * 24 * 60 * 60 * 1000));
+      expires = "; expires=" + date.toUTCString();
+    }
     document.cookie = name + "=" + value + expires + "; path=/";
   }
   
@@ -224,14 +228,15 @@
     };
   }
 
+  // ENHANCED: Extract all UTM parameters, not just the standard 5
   function extractUtmParams() {
     var queryParams = new URLSearchParams(window.location.search);
     var utmParams = {};
-    var utmTags = ['utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content'];
     
-    utmTags.forEach(function(tag) {
-      if (queryParams.has(tag)) {
-        utmParams[tag] = queryParams.get(tag);
+    // Iterate through all query parameters and capture any that start with 'utm_'
+    queryParams.forEach(function(value, key) {
+      if (key.toLowerCase().startsWith('utm_')) {
+        utmParams[key.toLowerCase()] = value;
       }
     });
     
@@ -413,37 +418,49 @@
     
     var payloadStr = JSON.stringify(batchPayload);
     
-    // Send the batch
+    // Send the batch with improved beacon/fetch handling
     if (navigator.sendBeacon) {
-      navigator.sendBeacon(config.endpoint, payloadStr);
+      // Create a Blob with the correct content type for sendBeacon
+      var blob = new Blob([payloadStr], { type: 'application/json' });
+      var sent = navigator.sendBeacon(config.endpoint, blob);
+      if (!sent) {
+        // If beacon fails, fallback to fetch
+        sendWithFetch(payloadStr);
+      }
     } else {
-      fetch(config.endpoint, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: payloadStr,
-        keepalive: true
-      }).catch(function(e) {
-        console.error('CDP: batch send failed', e);
-      });
+      sendWithFetch(payloadStr);
     }
   }
   
   function sendSingle(payload) {
     var payloadStr = JSON.stringify(payload);
+    
+    // Send with improved beacon/fetch handling
     if (navigator.sendBeacon) {
-      navigator.sendBeacon(config.endpoint, payloadStr);
+      // Create a Blob with the correct content type for sendBeacon
+      var blob = new Blob([payloadStr], { type: 'application/json' });
+      var sent = navigator.sendBeacon(config.endpoint, blob);
+      if (!sent) {
+        // If beacon fails, fallback to fetch
+        sendWithFetch(payloadStr);
+      }
     } else {
-      fetch(config.endpoint, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: payloadStr,
-        keepalive: true
-      }).catch(function(e) {
-        console.error('CDP: send failed', e);
-      });
+      sendWithFetch(payloadStr);
     }
   }
+  
+  function sendWithFetch(payloadStr) {
+    fetch(config.endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: payloadStr,
+      keepalive: true
+    }).catch(function(e) {
+      console.error('CDP: send failed', e);
+    });
+  }
 
+  // ENHANCED: Modified track function with user identification capabilities
   function trackEvent(eventName, properties) {
     var now = new Date().toISOString();
     var pageOverrides = properties && properties._page ? properties._page : null;
@@ -484,9 +501,44 @@
       eventData.utm = utmParams;
     }
 
+    // ENHANCED: Handle user identification within track events
+    // If user_id is provided in userOverrides, update state and cookie
+    if (userOverrides && userOverrides.user_id && userOverrides.user_id !== state.userId) {
+      state.userId = userOverrides.user_id;
+      setCookie('cdp_user_id', userOverrides.user_id, config.cookie_expires);
+      
+      // Optionally send a separate identification event
+      var identifyData = {
+        event: 'user_identified',
+        event_id: generateId(),
+        timestamp: now,
+        properties: {
+          previous_anonymous_id: state.anonymousId,
+          identified_user_id: userOverrides.user_id
+        },
+        user: {
+          user_id: userOverrides.user_id,
+          anonymous_id: state.anonymousId
+        },
+        session: {
+          id: state.sessionId
+        },
+        page: getPageData(),
+        client: getClientData(),
+        sent_at: now
+      };
+      
+      if (Object.keys(utmParams).length > 0) {
+        identifyData.utm = utmParams;
+      }
+      
+      send(identifyData);
+    }
+
     send(eventData);
   }
 
+  // LEGACY: Keep identify function for backward compatibility
   function identifyUser(traits) {
     var now = new Date().toISOString();
     traits = traits || {};
@@ -553,7 +605,8 @@
     if (existingSessionId) {
       state.sessionId = existingSessionId;
     } else {
-      setCookie('cdp_session_id', state.sessionId, config.cookie_expires);
+      // Session cookie - no expiration date, expires when browser closes
+      setCookie('cdp_session_id', state.sessionId, null);
     }
 
     // Extract UTM parameters from URL on initialization
