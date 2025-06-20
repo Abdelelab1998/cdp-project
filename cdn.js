@@ -26,9 +26,9 @@
     userId: null,
     anonymousId: generateId(),
     sessionId: generateId(),
-    utmParams: {}, // Store UTM parameters
-    eventQueue: [], // Store events for batching
-    batchTimerId: null // Timer for batch sending
+    utmParams: {},
+    eventQueue: [],
+    batchTimerId: null
   };
 
   function generateId() {
@@ -40,7 +40,6 @@
 
   // Use a synchronous hashing function for SHA-256
   function sha256Sync(str) {
-    // This is a JavaScript implementation of SHA-256
     var SHA256 = function(s) {
       var chrsz = 8;
       var hexcase = 0;
@@ -172,26 +171,47 @@
       date.setTime(date.getTime() + (days * 24 * 60 * 60 * 1000));
       expires = "; expires=" + date.toUTCString();
     }
-    document.cookie = name + "=" + value + expires + "; path=/";
+    document.cookie = name + "=" + value + expires + "; path=/; SameSite=Lax";
   }
   
+  // ENHANCED: Store UTM parameters in both sessionStorage AND persistent cookie for cross-domain
   function storeUtmParams(utmParams) {
-    // Store UTM parameters in sessionStorage specifically
     if (Object.keys(utmParams).length > 0) {
+      // Store in sessionStorage for current session
       window.sessionStorage.setItem('cdp_utm_params', JSON.stringify(utmParams));
+      
+      // Store in persistent cookie for cross-domain (365 days like other persistent data)
+      setCookie('cdp_utm_params', JSON.stringify(utmParams), config.cookie_expires);
+      
+      console.log('CDP: UTM parameters stored:', utmParams);
     }
   }
   
+  // ENHANCED: Get UTM parameters from both sources
   function getStoredUtmParams() {
-    // Get UTM parameters from sessionStorage
-    var storedUtms = window.sessionStorage.getItem('cdp_utm_params');
-    if (storedUtms) {
+    // Try sessionStorage first (current session)
+    var sessionUtms = window.sessionStorage.getItem('cdp_utm_params');
+    if (sessionUtms) {
       try {
-        return JSON.parse(storedUtms);
+        return JSON.parse(sessionUtms);
       } catch (e) {
         console.error('CDP: Failed to parse UTM params from sessionStorage', e);
       }
     }
+    
+    // Fallback to persistent cookie (cross-domain/cross-session)
+    var cookieUtms = getCookie('cdp_utm_params');
+    if (cookieUtms) {
+      try {
+        var parsedUtms = JSON.parse(cookieUtms);
+        // Also update sessionStorage for current session
+        window.sessionStorage.setItem('cdp_utm_params', cookieUtms);
+        return parsedUtms;
+      } catch (e) {
+        console.error('CDP: Failed to parse UTM params from cookie', e);
+      }
+    }
+    
     return {};
   }
 
@@ -228,83 +248,75 @@
     };
   }
 
-  // ENHANCED: Extract all UTM parameters, not just the standard 5
+  // ENHANCED: Extract ALL UTM parameters from URL with better persistence
   function extractUtmParams() {
     var queryParams = new URLSearchParams(window.location.search);
     var utmParams = {};
+    var hasNewUtms = false;
     
-    // Iterate through all query parameters and capture any that start with 'utm_'
+    // Capture ANY parameter that starts with 'utm_'
     queryParams.forEach(function(value, key) {
       if (key.toLowerCase().startsWith('utm_')) {
         utmParams[key.toLowerCase()] = value;
+        hasNewUtms = true;
       }
     });
     
-    // Store UTM params in state if any were found
-    if (Object.keys(utmParams).length > 0) {
+    // If we found NEW UTM parameters in the URL, use them and store them
+    if (hasNewUtms) {
       state.utmParams = utmParams;
-      // Store in sessionStorage specifically for UTMs
       storeUtmParams(utmParams);
-    }
-    
-    return utmParams;
-  }
-
-  function getUtmParams() {
-    // Return UTM params from state, or try to load from sessionStorage
-    if (Object.keys(state.utmParams).length === 0) {
+      console.log('CDP: New UTM parameters captured from URL:', utmParams);
+    } else {
+      // No UTMs in URL, try to load from storage
       var storedUtms = getStoredUtmParams();
       if (Object.keys(storedUtms).length > 0) {
         state.utmParams = storedUtms;
+        console.log('CDP: UTM parameters loaded from storage:', storedUtms);
       }
     }
+    
+    return state.utmParams;
+  }
+
+  function getUtmParams() {
+    // Always return current UTM params from state
     return state.utmParams;
   }
 
   function detectAndHashSensitiveData(obj) {
-    // If auto_hash is disabled, return the original object
     if (!config.sensitive_data.auto_hash) {
       return obj;
     }
     
-    // If input isn't an object or is null, return as is
     if (!obj || typeof obj !== 'object') {
       return obj;
     }
     
-    // Process arrays recursively
     if (Array.isArray(obj)) {
       return obj.map(item => detectAndHashSensitiveData(item));
     }
     
-    // Create new object to avoid modifying the original
     var result = {};
     
-    // Iterate through object properties
     for (var key in obj) {
       if (obj.hasOwnProperty(key)) {
         var value = obj[key];
         
-        // If value is an object (including arrays), process recursively
         if (value !== null && typeof value === 'object') {
           result[key] = detectAndHashSensitiveData(value);
         }
-        // If value is a string, check for sensitive patterns
         else if (typeof value === 'string') {
-          // Check if it matches email pattern
           if (config.sensitive_data.patterns.email.test(value)) {
             result[key] = sha256Sync(value);
           }
-          // Check if it matches phone pattern
           else if (config.sensitive_data.patterns.phone.test(value)) {
             result[key] = sha256Sync(value);
           }
-          // Otherwise keep the original value
           else {
             result[key] = value;
           }
         }
-        // For non-strings, keep as is
         else {
           result[key] = value;
         }
@@ -314,85 +326,16 @@
     return result;
   }
 
-  function syncCrossDomainId() {
-    if (!config.cross_domain.enabled || !config.cross_domain.domains.length) return;
-    
-    try {
-      // Create a hidden iframe to sync cookies across domains
-      var iframe = document.createElement('iframe');
-      iframe.style.display = 'none';
-      iframe.src = createSyncUrl();
-      document.body.appendChild(iframe);
-      
-      // Remove iframe after sync attempt
-      setTimeout(function() {
-        if (iframe && iframe.parentNode) {
-          iframe.parentNode.removeChild(iframe);
-        }
-      }, 2000);
-    } catch (e) {
-      console.error('CDP: Cross-domain sync failed', e);
-    }
-  }
-  
-  function createSyncUrl() {
-    // Find a domain different from current one to sync with
-    var currentDomain = window.location.hostname;
-    var targetDomain = '';
-    
-    for (var i = 0; i < config.cross_domain.domains.length; i++) {
-      if (config.cross_domain.domains[i] !== currentDomain) {
-        targetDomain = config.cross_domain.domains[i];
-        break;
-      }
-    }
-    
-    if (!targetDomain) return '';
-    
-    // Create sync URL with user and session IDs
-    return 'https://' + targetDomain + '/cdp-sync.html' + 
-           '?anonymous_id=' + encodeURIComponent(state.anonymousId) + 
-           '&session_id=' + encodeURIComponent(state.sessionId) + 
-           (state.userId ? '&user_id=' + encodeURIComponent(state.userId) : '');
-  }
-  
-  function processSyncParams() {
-    // Check if the URL has sync parameters
-    var params = new URLSearchParams(window.location.search);
-    var syncAnonymousId = params.get('anonymous_id');
-    var syncSessionId = params.get('session_id');
-    var syncUserId = params.get('user_id');
-    
-    if (syncAnonymousId) {
-      state.anonymousId = syncAnonymousId;
-      setCookie('cdp_anonymous_id', syncAnonymousId, config.cookie_expires);
-    }
-    
-    if (syncSessionId) {
-      state.sessionId = syncSessionId;
-      setCookie('cdp_session_id', syncSessionId, config.cookie_expires);
-    }
-    
-    if (syncUserId) {
-      state.userId = syncUserId;
-      setCookie('cdp_user_id', syncUserId, config.cookie_expires);
-    }
-  }
-
   function send(payload) {
-    // If batching is enabled, add to queue
     if (config.batch_events) {
       state.eventQueue.push(payload);
       
-      // If we've reached batch size, send immediately
       if (state.eventQueue.length >= config.batch_size) {
         sendBatch();
       } else if (!state.batchTimerId) {
-        // Otherwise set a timer to send batch after timeout
         state.batchTimerId = setTimeout(sendBatch, config.batch_timeout);
       }
     } else {
-      // Otherwise send immediately
       sendSingle(payload);
     }
   }
@@ -400,17 +343,14 @@
   function sendBatch() {
     if (state.eventQueue.length === 0) return;
     
-    // Clear any existing timer
     if (state.batchTimerId) {
       clearTimeout(state.batchTimerId);
       state.batchTimerId = null;
     }
     
-    // Get events to send
     var events = state.eventQueue;
     state.eventQueue = [];
     
-    // Create batch payload
     var batchPayload = {
       batch: events,
       sent_at: new Date().toISOString()
@@ -418,13 +358,10 @@
     
     var payloadStr = JSON.stringify(batchPayload);
     
-    // Send the batch with improved beacon/fetch handling
     if (navigator.sendBeacon) {
-      // Create a Blob with the correct content type for sendBeacon
       var blob = new Blob([payloadStr], { type: 'application/json' });
       var sent = navigator.sendBeacon(config.endpoint, blob);
       if (!sent) {
-        // If beacon fails, fallback to fetch
         sendWithFetch(payloadStr);
       }
     } else {
@@ -435,13 +372,10 @@
   function sendSingle(payload) {
     var payloadStr = JSON.stringify(payload);
     
-    // Send with improved beacon/fetch handling
     if (navigator.sendBeacon) {
-      // Create a Blob with the correct content type for sendBeacon
       var blob = new Blob([payloadStr], { type: 'application/json' });
       var sent = navigator.sendBeacon(config.endpoint, blob);
       if (!sent) {
-        // If beacon fails, fallback to fetch
         sendWithFetch(payloadStr);
       }
     } else {
@@ -460,62 +394,54 @@
     });
   }
 
-  // ENHANCED: Modified track function with user identification capabilities
+  // ENHANCED: Unified track function that handles user identification
   function trackEvent(eventName, properties) {
     var now = new Date().toISOString();
+    
+    // Handle special properties
     var pageOverrides = properties && properties._page ? properties._page : null;
     var userOverrides = properties && properties._user ? properties._user : null;
+    var userTraits = properties && properties._traits ? properties._traits : null;
 
+    // Clean up special properties from the main properties object
     if (properties) {
       delete properties._page;
       delete properties._user;
+      delete properties._traits;
     }
 
     properties = properties || {};
-
-    // Apply automatic sensitive data hashing if enabled
     properties = detectAndHashSensitiveData(properties);
 
     // Get UTM parameters
     var utmParams = getUtmParams();
 
-    var eventData = {
-      event: eventName,
-      event_id: generateId(),
-      timestamp: now,
-      properties: properties,
-      user: {
-        user_id: userOverrides && userOverrides.user_id ? userOverrides.user_id : state.userId,
-        anonymous_id: state.anonymousId
-      },
-      session: {
-        id: state.sessionId
-      },
-      page: getPageData(pageOverrides),
-      client: getClientData(),
-      sent_at: now
-    };
-
-    // Add UTM parameters as a top-level object if they exist
-    if (Object.keys(utmParams).length > 0) {
-      eventData.utm = utmParams;
-    }
-
-    // ENHANCED: Handle user identification within track events
-    // If user_id is provided in userOverrides, update state and cookie
+    // Handle user identification FIRST (before creating the main event)
+    var isNewUser = false;
     if (userOverrides && userOverrides.user_id && userOverrides.user_id !== state.userId) {
+      isNewUser = true;
+      var previousAnonymousId = state.anonymousId;
+      
+      // Update state and cookie
       state.userId = userOverrides.user_id;
       setCookie('cdp_user_id', userOverrides.user_id, config.cookie_expires);
       
-      // Optionally send a separate identification event
+      // Create identification event with traits
+      var identifyProperties = {
+        previous_anonymous_id: previousAnonymousId,
+        identified_user_id: userOverrides.user_id
+      };
+      
+      // Merge in any traits provided
+      if (userTraits) {
+        identifyProperties = Object.assign(identifyProperties, detectAndHashSensitiveData(userTraits));
+      }
+      
       var identifyData = {
         event: 'user_identified',
         event_id: generateId(),
         timestamp: now,
-        properties: {
-          previous_anonymous_id: state.anonymousId,
-          identified_user_id: userOverrides.user_id
-        },
+        properties: identifyProperties,
         user: {
           user_id: userOverrides.user_id,
           anonymous_id: state.anonymousId
@@ -533,53 +459,36 @@
       }
       
       send(identifyData);
+      console.log('CDP: User identified:', userOverrides.user_id);
     }
 
-    send(eventData);
-  }
-
-  // LEGACY: Keep identify function for backward compatibility
-  function identifyUser(traits) {
-    var now = new Date().toISOString();
-    traits = traits || {};
-
-    // Apply automatic sensitive data hashing if enabled
-    traits = detectAndHashSensitiveData(traits);
-
-    // Get UTM parameters
-    var utmParams = getUtmParams();
-
+    // Create the main event
     var eventData = {
-      event: 'identify',
+      event: eventName,
       event_id: generateId(),
       timestamp: now,
-      properties: traits,
+      properties: properties,
       user: {
-        user_id: traits.user_id || state.userId,
+        user_id: userOverrides && userOverrides.user_id ? userOverrides.user_id : state.userId,
         anonymous_id: state.anonymousId
       },
       session: {
         id: state.sessionId
       },
+      page: getPageData(pageOverrides),
+      client: getClientData(),
       sent_at: now
     };
 
-    // Add UTM parameters as a top-level object if they exist
+    // Add UTM parameters if they exist
     if (Object.keys(utmParams).length > 0) {
       eventData.utm = utmParams;
-    }
-
-    // If user_id is provided, update state and cookie
-    if (traits.user_id) {
-      state.userId = traits.user_id;
-      setCookie('cdp_user_id', traits.user_id, config.cookie_expires);
     }
 
     send(eventData);
   }
 
   function init(options) {
-    // Apply any provided options to configuration
     if (options) {
       for (var key in options) {
         if (options.hasOwnProperty(key) && config.hasOwnProperty(key)) {
@@ -605,27 +514,23 @@
     if (existingSessionId) {
       state.sessionId = existingSessionId;
     } else {
-      // Session cookie - no expiration date, expires when browser closes
       setCookie('cdp_session_id', state.sessionId, null);
     }
 
-    // Extract UTM parameters from URL on initialization
+    // Extract UTM parameters immediately on init (handles both new UTMs and stored ones)
     extractUtmParams();
     
-    // Process cross-domain sync parameters if present
-    processSyncParams();
-    
-    // If cross-domain tracking is enabled, sync IDs with other domains
-    if (config.cross_domain.enabled) {
-      // Delay sync to ensure the page has loaded
-      setTimeout(syncCrossDomainId, 1000);
-    }
-    
-    // Set up beforeunload handler to flush any queued events when the page unloads
     window.addEventListener('beforeunload', function() {
       if (state.eventQueue.length > 0) {
         sendBatch();
       }
+    });
+
+    console.log('CDP V4 Final initialized with state:', {
+      anonymous_id: state.anonymousId,
+      user_id: state.userId,
+      session_id: state.sessionId,
+      utm_params: state.utmParams
     });
   }
 
@@ -639,60 +544,34 @@
       case 'track':
         trackEvent(params[0], params[1]);
         break;
-      case 'identify':
-        identifyUser(params[0]);
-        break;
       case 'config':
         for (var key in params[0]) {
-          if (params[0].hasOwnProperty(key)) {
-            if (key === 'cross_domain') {
-              // Handle cross_domain config object
-              if (typeof params[0][key] === 'object') {
-                if (params[0][key].hasOwnProperty('enabled')) {
-                  config.cross_domain.enabled = !!params[0][key].enabled;
-                }
-                if (params[0][key].hasOwnProperty('domains') && Array.isArray(params[0][key].domains)) {
-                  config.cross_domain.domains = params[0][key].domains;
-                }
-                // If enabling cross domain with domains, trigger sync
-                if (config.cross_domain.enabled && config.cross_domain.domains.length > 0) {
-                  syncCrossDomainId();
-                }
-              }
-            } else if (key === 'sensitive_data') {
-              // Handle sensitive_data config object
-              if (typeof params[0][key] === 'object') {
-                if (params[0][key].hasOwnProperty('auto_hash')) {
-                  config.sensitive_data.auto_hash = !!params[0][key].auto_hash;
-                }
-              }
-            } else if (config.hasOwnProperty(key)) {
-              config[key] = params[0][key];
-            }
+          if (params[0].hasOwnProperty(key) && config.hasOwnProperty(key)) {
+            config[key] = params[0][key];
           }
         }
         break;
       case 'init':
-        // init should be called with minimal or no options
         init(params[0] || {});
         break;
       case 'hash':
         return sha256Sync(params[0]);
       case 'flushQueue':
-        // Force send any queued events
         if (state.eventQueue.length > 0) {
           sendBatch();
         }
         break;
+      case 'debug':
+        console.log('CDP State:', state);
+        console.log('CDP Config:', config);
+        break;
       default:
-        console.error('Unknown command:', command);
+        console.error('Unknown CDP command:', command);
     }
   };
 
-  // Make hash function available through the cdp object
   window.cdp.hash = sha256Sync;
 
-  // Process any commands that were queued before the script loaded
   for (var i = 0; i < cdpQueue.length; i++) {
     window.cdp.apply(window, cdpQueue[i]);
   }
